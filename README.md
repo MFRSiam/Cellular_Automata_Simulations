@@ -1,5 +1,10 @@
-# This is a Small Cellular automata Project of Mine.
+# This is a Small Cellular Automata Project of Mine.
 
-Just Wanted Some To get the Hang of The library and the concepts of cellular automata.
+**Dependencies Are Raylib and GLFW3**
 
-This mini project has some particles you see in the famous game Noita. My Goal is to implement all the particles from the game. Till now i only have Sand and Wood.
+This Projects Aims to include all of the particles from the famouse game Noita.
+
+```
+Implemented :   1.Wood
+                2.Sand
+```

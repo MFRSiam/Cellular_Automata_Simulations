@@ -9,7 +9,7 @@
 #include <math.h>
 #include <string.h>
 
-
+// Every Actor in the Scene is a CELL
 struct Cell{
     Vector2 Pos;
     char propertie;
