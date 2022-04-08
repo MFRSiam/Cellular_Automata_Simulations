@@ -10,8 +10,9 @@ int main() {
 //    const int screenHeight = 450;
     const int screenWidth = 1000;
     const int screenHeight = 800;
-    int playHeight = screenHeight/10;
-    int playWidth = screenWidth/10;
+    const float resulution = 8;
+    int playHeight = (int)((float)screenHeight/resulution);
+    int playWidth = (int)((float)screenWidth/resulution);
 
     InitWindow(screenWidth, screenHeight, "My Basic Window");
     SetTargetFPS(144);
@@ -21,25 +22,11 @@ int main() {
         players[i] = (Cell*) calloc(playWidth,sizeof(Cell));
     }
 
-    float box_x=0.0f,box_y=0.0f;
-    for(int i=0;i<playHeight;i++){
-        for(int j=0;j<playWidth;j++){
-            players[i][j].propertie = 'n';
-            players[i][j].Pos.x = box_x;
-            players[i][j].Pos.y = box_y;
-            box_x += 10.0f;
-
-        }
-        box_x = 0.0f;
-        box_y += 10.0f;
-        if(box_y>(float)screenHeight){
-            box_y = 0.0f;
-        }
-    }
+    InitiateCells(players,playHeight,playWidth,screenHeight,resulution);
     SetFloor(players,playWidth,playHeight);
 
     Vector2 mousePosition;
-    Vector2 size = {10,10};
+    Vector2 size = {resulution,resulution};
     char mode = 's';
     while (!WindowShouldClose())
     {
@@ -48,10 +35,10 @@ int main() {
         checkMode(&mode);
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)){
 
-            SpawnStuff(players,&mousePosition,&mode, screenWidth,screenHeight);
+            SpawnStuff(players,&mousePosition,&mode, screenWidth,screenHeight, resulution);
         }
-        else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)){
-
+        else if (IsKeyDown(KEY_R)){
+            ResetMap(players,playHeight,playWidth);
         }
 
 
