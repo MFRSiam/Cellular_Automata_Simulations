@@ -10,9 +10,9 @@ int main() {
 //    const int screenHeight = 450;
     const int screenWidth = 1000;
     const int screenHeight = 800;
-    const float resulution = 8;
-    int playHeight = (int)((float)screenHeight/resulution);
-    int playWidth = (int)((float)screenWidth/resulution);
+    const float resolution = 8;
+    int playHeight = (int)((float)screenHeight / resolution);
+    int playWidth = (int)((float)screenWidth / resolution);
 
     InitWindow(screenWidth, screenHeight, "My Basic Window");
     SetTargetFPS(144);
@@ -22,11 +22,11 @@ int main() {
         players[i] = (Cell*) calloc(playWidth,sizeof(Cell));
     }
 
-    InitiateCells(players,playHeight,playWidth,screenHeight,resulution);
+    InitiateCells(players, playHeight, playWidth, screenHeight, resolution);
     SetFloor(players,playWidth,playHeight);
 
     Vector2 mousePosition;
-    Vector2 size = {resulution,resulution};
+    Vector2 size = {resolution, resolution};
     char mode = 's';
     while (!WindowShouldClose())
     {
@@ -35,7 +35,7 @@ int main() {
         checkMode(&mode);
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)){
 
-            SpawnStuff(players,&mousePosition,&mode, screenWidth,screenHeight, resulution);
+            SpawnStuff(players, &mousePosition, &mode, screenWidth, screenHeight, resolution);
         }
         else if (IsKeyDown(KEY_R)){
             ResetMap(players,playHeight,playWidth);
