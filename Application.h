@@ -10,11 +10,22 @@
 #include <string.h>
 
 // Every Actor in the Scene is a CELL
+enum CellType{
+    Wood,
+    Sand,
+    Water,
+    Floor,
+    Null
+}typedef CellType;
+
+
 struct Cell{
     Vector2 Pos;
-    char propertie;
+    CellType Type;
     float velocity;
 }typedef Cell;
+
+
 
 
 /*! @brief This Crates a Floor in the Array consisting of f as a indicator of being floor.
