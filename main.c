@@ -1,6 +1,5 @@
 #include <raylib.h>
 #include <stdlib.h>
-#include <sqlite3.h>
 #include "Application.h"
 
 
@@ -44,7 +43,8 @@ int main() {
 
 
         double time = GetTime();
-//        printf("%f",time);
+
+        printf("%f ,",time);
         if(time>1.0f){
             UpdateMap(players,playHeight,playWidth);
             time = 0.0f;
