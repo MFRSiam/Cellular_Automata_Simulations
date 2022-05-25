@@ -111,19 +111,21 @@ void WaterLogic(Cell **ptr,int i, int j,int height_y,int width_x){
     if((i+1) >= height_y || (j+1) >= width_x || (i-1)<0 || (j-1)<0){
         return;
     }
-    if(j == (width_x-2) || j == 0){
-        ptr[i][j].velocity *= -1.0f;
-    }
     if(ptr[i+1][j].propertie == 'n'){
         ptr[i][j].propertie = 'n';
         ptr[i+1][j].propertie = 'l';
-    }else if(ptr[i][j-1].propertie=='n' && ptr[i][j+1].propertie!='n'){
+    }else if(ptr[i+1][j+1].propertie=='n'){
+        ptr[i][j].propertie = 'n';
+        ptr[i+1][j+1].propertie = 'l';
+    }else if(ptr[i+1][j-1].propertie =='n'){
         ptr[i][j].propertie = 'n';
         ptr[i][j-1].propertie = 'l';
-    }else if(ptr[i][j-1].propertie!='n' && ptr[i][j+1].propertie=='n'){
+    }else if(ptr[i][j+1].propertie == 'n'){
         ptr[i][j].propertie = 'n';
-        ptr[i][j+1].propertie = 'l';
-
+        ptr[i][j+1].propertie ='l';
+    }else if(ptr[i][j-1].propertie == 'n'){
+        ptr[i][j].propertie = 'n';
+        ptr[i][j-1].propertie ='l';
     }
 }
 
