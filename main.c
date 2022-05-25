@@ -40,16 +40,13 @@ int main() {
             ResetMap(players,playHeight,playWidth);
         }
 
-
-
         double time = GetTime();
 
-        printf("%f ,",time);
+        //printf("%f ,",time);
         if(time>1.0f){
             UpdateMap(players,playHeight,playWidth);
             time = 0.0f;
         }
-
         BeginDrawing();
         ClearBackground(RAYWHITE);
         ApplicationDraw(players,size,playHeight,playWidth);
