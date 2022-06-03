@@ -51,6 +51,7 @@ int main() {
         }
         BeginDrawing();
         ClearBackground(RAYWHITE);
+
         ApplicationDraw(cells,size,playHeight,playWidth);
         EndDrawing();
 

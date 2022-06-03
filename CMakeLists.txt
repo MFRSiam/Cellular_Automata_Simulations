@@ -2,9 +2,14 @@ cmake_minimum_required(VERSION 3.21)
 project(SandSimulation_Raylib C)
 
 set(CMAKE_C_STANDARD 23)
-
-include_directories(${CMAKE_SOURCE_DIR}/Raylib/include)
+include(FetchContent)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_GAMES    OFF CACHE BOOL "" FORCE) 
+FetchContent_Declare(raylib GIT_REPOSITORY https://github.com/raysan5/raylib.git GIT_TAG master)
+FetchContent_MakeAvailable(raylib)
 
 add_executable(SandSimulation_Raylib main.c Application.c Application.h)
 link_directories(${CMAKE_SOURCE_DIR}/Raylib)
-target_link_libraries(SandSimulation_Raylib ${CMAKE_SOURCE_DIR}/Raylib/libraylib.a ${CMAKE_SOURCE_DIR}/Raylib/libglfw3.a opengl32 gdi32 winmm)
+target_sources(${PROJECT_NAME} PRIVATE ${PROJECT_SOURCES})
+target_include_directories(${PROJECT_NAME} PRIVATE ${PROJECT_INCLUDE})
+target_link_libraries(${PROJECT_NAME} PRIVATE raylib)
