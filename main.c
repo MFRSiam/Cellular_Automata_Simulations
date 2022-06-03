@@ -1,4 +1,5 @@
 #include <raylib.h>
+
 #include <stdlib.h>
 #include <math.h>
 #include "Application.h"
