@@ -5,22 +5,30 @@
 
 
 
+
 int main(void)
 {
     const int screenWidth = 800;
-    const int screenHeight = 450;
+    const int screenHeight = 600;
 
-    InitWindow(screenWidth, screenHeight, "raylib [core] example - basic window");
+    InitWindow(screenWidth, screenHeight, "Cellular Automata");
     SetTargetFPS(60);
+
+    int gridSize = 32;
+    int rows = screenHeight / gridSize;
+    int columns = screenWidth / gridSize;
+    int elements = rows * columns;
+    Nodes *arr = (Nodes*) malloc(elements * sizeof(Nodes));
+
 
     while (!WindowShouldClose())
     {
         BeginDrawing();
-        ClearBackground(RAYWHITE);
-        DrawText("Congrats! You created your first window!", 190, 200, 20, LIGHTGRAY);
+
         EndDrawing();
     }
     CloseWindow();
+    free(arr);
 
     return 0;
 }
