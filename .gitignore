@@ -1,2 +1,9 @@
-# Project exclude paths
+# Build output
 /cmake-build-debug/
+/cmake-build-debug-mingw/
+/build/
+/out/
+
+# IDE
+/.idea/
+/.vs/

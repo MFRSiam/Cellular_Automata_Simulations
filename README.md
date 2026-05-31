@@ -2,9 +2,6 @@
 
 **Dependencies Are Raylib and GLFW3**
 
-This Projects Aims to include all the particles from the famous game Noita.
-
-```
-Implemented :   1.Wood
-                2.Sand
-```
+This Projects Tries to Incorporate Some Cellular automata.
+Next To Implement:
+    1.Conways Game Of Life
