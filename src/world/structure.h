@@ -17,7 +17,8 @@
 
 typedef struct Structure {
     int   w, h;
-    Cell *cells; // w*h, row-major; CELL_EMPTY = transparent (keep terrain)
+    Cell *cells;      // w*h, row-major; CELL_EMPTY = transparent (keep terrain)
+    char  path[512];  // source file on disk (for deletion); empty if none
 } Structure;
 
 // Load every structures/*.txt into the registry. Safe if the dir is missing.
@@ -30,6 +31,9 @@ const Structure *Structure_Get(int index);
 
 // Register a captured region and write it to `path`. Takes a copy of `cells`.
 bool Structure_AddAndSave(int w, int h, const Cell *cells, const char *path);
+
+// Remove a structure from the registry and delete its file on disk.
+bool Structure_Delete(int index);
 
 // Material to place at an absolute world cell, or CELL_EMPTY if none.
 Cell StructureSampleAt(unsigned int seed, int wx, int wy);

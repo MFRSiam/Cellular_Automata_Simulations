@@ -47,6 +47,7 @@ void Structure_LoadAll(const char *dir) {
         char *text = LoadFileText(files.paths[i]);
         if (!text) continue;
         if (ParseStructure(text, &s_list[s_count])) {
+            snprintf(s_list[s_count].path, sizeof s_list[s_count].path, "%s", files.paths[i]);
             TraceLog(LOG_INFO, "STRUCT: loaded %s (%dx%d)", GetFileName(files.paths[i]),
                      s_list[s_count].w, s_list[s_count].h);
             s_count++;
@@ -75,8 +76,20 @@ bool Structure_AddAndSave(int w, int h, const Cell *cells, const char *path) {
     // Add a live copy to the registry.
     Cell *copy = malloc((size_t)w * h * sizeof(Cell));
     memcpy(copy, cells, (size_t)w * h * sizeof(Cell));
-    s_list[s_count++] = (Structure){.w = w, .h = h, .cells = copy};
+    s_list[s_count] = (Structure){.w = w, .h = h, .cells = copy};
+    snprintf(s_list[s_count].path, sizeof s_list[s_count].path, "%s", path);
+    s_count++;
     TraceLog(LOG_INFO, "STRUCT: saved %s (%dx%d)", path, w, h);
+    return true;
+}
+
+bool Structure_Delete(int index) {
+    if (index < 0 || index >= s_count) return false;
+    if (s_list[index].path[0]) remove(s_list[index].path); // best-effort file delete
+    free(s_list[index].cells);
+    for (int i = index; i < s_count - 1; i++) s_list[i] = s_list[i + 1];
+    s_count--;
+    TraceLog(LOG_INFO, "STRUCT: deleted #%d (%d remaining)", index, s_count);
     return true;
 }
 

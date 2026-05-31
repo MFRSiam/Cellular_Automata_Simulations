@@ -119,11 +119,12 @@ StrMgrAction StrMgr_Draw(int w, int h) {
     if (M.scroll > maxScroll) M.scroll = maxScroll;
 
     if (M.count == 0) {
-        DrawText("No structures yet. Click \"New Structure\" to capture one in-world.",
+        DrawText("No structures yet. Click \"New Structure\" to open the editor.",
                  (int)area.x + 8, (int)area.y + 8, 20, (Color){150, 160, 175, 255});
         return action;
     }
 
+    int pendingDelete = -1;
     BeginScissorMode((int)area.x, (int)area.y, (int)area.width, (int)area.height);
     for (int i = 0; i < M.count; i++) {
         int cx = i % cols, cy = i / cols;
@@ -131,8 +132,17 @@ StrMgrAction StrMgr_Draw(int w, int h) {
         float y = area.y + cy * (cell + gap) - M.scroll;
         if (y + cell < area.y || y > area.y + area.height) continue; // cull off-screen
         DrawCard(i, x, y, cell);
+        // Per-card delete button (top-right corner).
+        if (GuiButton((Rectangle){x + cell - 34, y + 8, 26, 26}, "X")) pendingDelete = i;
     }
     EndScissorMode();
+
+    // Apply a delete after the loop so indices stay stable while drawing.
+    if (pendingDelete >= 0) {
+        Structure_Delete(pendingDelete);
+        StrMgr_Refresh();
+        return action;
+    }
 
     // Scrollbar hint.
     if (maxScroll > 0) {

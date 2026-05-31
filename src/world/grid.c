@@ -246,6 +246,37 @@ static void Ignite(Grid *g, int x, int y) {
     g->updated[Idx(g, x, y)] = 1;
 }
 
+// Materials that carry electricity (a spark will arc along them).
+static inline bool Conductor(Cell c) {
+    return c == CELL_METAL || c == CELL_COPPER || c == CELL_GOLD ||
+           c == CELL_WATER || c == CELL_MERCURY || c == CELL_ACID || c == CELL_CRYSTAL;
+}
+
+// A blast: fills nearby air with fire, ignites flammables, and blows apart soft
+// matter. Hard materials (metal/rock/glass/obsidian/crystal/copper) resist.
+// Gunpowder neighbours are left intact so the spreading fire chains them.
+static void Explode(Grid *g, int cx, int cy, int r) {
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy > r * r) continue;
+            int x = cx + dx, y = cy + dy;
+            if (!GridInBounds(g, x, y)) continue;
+            Cell c = GridGet(g, x, y);
+            if (c == CELL_GUNPOWDER) continue;            // let the fire chain it
+            if (c == CELL_EMPTY) { if (GetRandomValue(0, 100) < 65) GridSet(g, x, y, CELL_FIRE); }
+            else if (Flammable(c)) Ignite(g, x, y);
+            else {
+                CellType t = TypeOf(c);
+                if ((t == TYPE_SOLID || t == TYPE_POWDER) && !MATERIALS[c].acidProof &&
+                    c != CELL_ROCK && c != CELL_BASALT && c != CELL_SANDSTONE &&
+                    GetRandomValue(0, 100) < 55)
+                    GridSet(g, x, y, GetRandomValue(0, 2) ? CELL_SMOKE : CELL_EMPTY);
+            }
+        }
+    }
+    GridSet(g, cx, cy, CELL_FIRE);
+}
+
 static bool StepFire(Grid *g, int x, int y) {
     int i = Idx(g, x, y);
     int fuel = 0, water = 0, waterAx = -1, waterAy = -1;
@@ -279,7 +310,8 @@ static bool StepFire(Grid *g, int x, int y) {
             return true;
         }
         if (g->life[i] == 0) {
-            GridSet(g, x, y, GetRandomValue(0, 2) == 0 ? CELL_EMPTY : CELL_SMOKE);
+            int r = GetRandomValue(0, 9); // burnt out: soot/ash residue or clears
+            GridSet(g, x, y, r < 2 ? CELL_ASH : (r < 6 ? CELL_SMOKE : CELL_EMPTY));
             return true;
         }
         g->life[i]--;
@@ -290,10 +322,12 @@ static bool StepFire(Grid *g, int x, int y) {
 }
 
 static bool StepAcid(Grid *g, int x, int y) {
+    int water = 0;
     for (int n = 0; n < 4; n++) {
         int ax = x + NX[n], ay = y + NY[n];
         if (!GridInBounds(g, ax, ay)) continue;
         Cell c = GridGet(g, ax, ay);
+        if (c == CELL_WATER) water++;
         CellType t = TypeOf(c);
         // Eats solids/powders, but acid-proof materials (glass, metal,
         // obsidian) contain it instead.
@@ -303,6 +337,9 @@ static bool StepAcid(Grid *g, int x, int y) {
             if (GetRandomValue(0, 100) < 30) { GridSet(g, x, y, CELL_EMPTY); return true; }
         }
     }
+    // Dilution: water neutralises acid into (harmless) water - the more water
+    // touching it, the faster it dilutes. Pour water on acid to wash it away.
+    if (water > 0 && GetRandomValue(0, 100) < water * 5) { GridSet(g, x, y, CELL_WATER); return true; }
     return false;
 }
 
@@ -347,10 +384,12 @@ static bool StepSmoke(Grid *g, int x, int y) {
 }
 
 static bool StepLava(Grid *g, int x, int y) {
+    bool hasAir = false;
     for (int n = 0; n < 4; n++) {
         int ax = x + NX[n], ay = y + NY[n];
         if (!GridInBounds(g, ax, ay)) continue;
         Cell c = GridGet(g, ax, ay);
+        if (c == CELL_EMPTY) hasAir = true;
         if (c == CELL_WATER || c == CELL_VAPOR) {        // quenched -> black stone
             GridSet(g, ax, ay, CELL_VAPOR);
             GridSet(g, x, y, CELL_BASALT);
@@ -358,14 +397,16 @@ static bool StepLava(Grid *g, int x, int y) {
             return true;
         }
         if (c == CELL_ICE)  { GridSet(g, ax, ay, CELL_WATER); }          // melt ice
-        if (c == CELL_SAND) { GridSet(g, ax, ay, CELL_MOLTEN_GLASS); }   // sand -> molten glass
+        if (c == CELL_SAND || c == CELL_GLASS) { GridSet(g, ax, ay, CELL_MOLTEN_GLASS); } // (re)melt to glass
+        if (c == CELL_WAX)  { GridSet(g, ax, ay, CELL_MOLTEN_WAX); }      // melt wax
         // Lava slowly melts ordinary rock back into lava (not metal/obsidian).
         if ((c == CELL_ROCK || c == CELL_MUD || c == CELL_SANDSTONE || c == CELL_BASALT) &&
             GetRandomValue(0, 1000) < 3) GridSet(g, ax, ay, CELL_LAVA);
         if (Flammable(c) && GetRandomValue(0, 1000) < 40) Ignite(g, ax, ay);
     }
-    // Cools in air to obsidian (a dark glass).
-    if (GetRandomValue(0, 2000) < 2) { GridSet(g, x, y, CELL_OBSIDIAN); return true; }
+    // Only cools to obsidian when its surface is exposed to air; lava sealed
+    // inside its shell (e.g. a contained lava lake) stays molten.
+    if (hasAir && GetRandomValue(0, 2000) < 2) { GridSet(g, x, y, CELL_OBSIDIAN); return true; }
     return false;
 }
 
@@ -394,6 +435,260 @@ static bool StepFlammableGas(Grid *g, int x, int y) {
 }
 
 // ---------------------------------------------------------------------------
+// Extra "science" reactions: phase changes, biology, chemistry.
+// ---------------------------------------------------------------------------
+
+// Water freezes when it's cold enough: surrounded by ice/snow and no heat
+// source nearby (a crude latent-heat / nucleation model).
+static bool StepWaterChem(Grid *g, int x, int y) {
+    int cold = 0, heat = 0;
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (c == CELL_ICE || c == CELL_SNOW) cold++;
+        else if (c == CELL_FIRE || c == CELL_LAVA || c == CELL_MOLTEN_GLASS) heat++;
+    }
+    if (heat == 0 && cold >= 2 && GetRandomValue(0, 1000) < 5) { GridSet(g, x, y, CELL_ICE); return true; }
+    return false;
+}
+
+// Moss is a plant: it photosynthesises and colonises damp soil. When water is
+// nearby it slowly spreads onto an adjacent mud / sand / sandstone cell.
+static void StepMoss(Grid *g, int x, int y) {
+    bool water = false;
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (GridInBounds(g, ax, ay) && GridGet(g, ax, ay) == CELL_WATER) { water = true; break; }
+    }
+    if (!water || GetRandomValue(0, 1000) >= 4) return;
+    int start = GetRandomValue(0, 3);
+    for (int k = 0; k < 4; k++) {
+        int n = (start + k) & 3;
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (c == CELL_MUD || c == CELL_SAND || c == CELL_SANDSTONE) { GridSet(g, ax, ay, CELL_MOSS); return; }
+    }
+}
+
+// Wet clay fired by heat turns to stone (ceramics): mud next to fire or lava
+// slowly bakes into sandstone.
+static void StepMud(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if ((c == CELL_FIRE || c == CELL_LAVA) && GetRandomValue(0, 1000) < 3) {
+            GridSet(g, x, y, CELL_SANDSTONE);
+            return;
+        }
+    }
+}
+
+// Acidic gas: a corrosive vapour. Eats adjacent non-acid-proof matter (like
+// acid, but airborne) and slowly dissipates. Caller still runs StepGas.
+static bool StepAcidGas(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        CellType t = TypeOf(c);
+        if ((t == TYPE_SOLID || t == TYPE_POWDER) && !MATERIALS[c].acidProof &&
+            GetRandomValue(0, 100) < 3)
+            GridSet(g, ax, ay, CELL_EMPTY);
+    }
+    if (GetRandomValue(0, 1000) < 2) { GridSet(g, x, y, CELL_EMPTY); return true; } // dissipate
+    return false;
+}
+
+// Grass lives over mud: it climbs a little, and creeps sideways across mud
+// surfaces (so it carpets the ground, including fresh mud left by worms).
+#define GRASS_MAX 5
+static void StepGrass(Grid *g, int x, int y) {
+    if (GetRandomValue(0, 1000) >= 6) return;
+
+    // Must be rooted: walk down through any grass stem to mud.
+    int stem = 0; bool soil = false;
+    for (int d = 1; d <= GRASS_MAX; d++) {
+        if (!GridInBounds(g, x, y + d)) break;
+        Cell c = GridGet(g, x, y + d);
+        if (c == CELL_GRASS) { stem++; continue; }
+        if (c == CELL_MUD)   soil = true;
+        break;
+    }
+    if (!soil) return;
+
+    // 1) climb upward a bit
+    if (stem < GRASS_MAX && GridInBounds(g, x, y - 1) && GridGet(g, x, y - 1) == CELL_EMPTY &&
+        GetRandomValue(0, 1) == 0) {
+        GridSet(g, x, y - 1, CELL_GRASS);
+        return;
+    }
+    // 2) propagate sideways onto an empty cell that also sits on mud/grass
+    int dir = GetRandomValue(0, 1) ? 1 : -1;
+    for (int s = 0; s < 2; s++) {
+        int nx = x + (s == 0 ? dir : -dir);
+        if (!GridInBounds(g, nx, y) || GridGet(g, nx, y) != CELL_EMPTY) continue;
+        if (!GridInBounds(g, nx, y + 1)) continue;
+        Cell below = GridGet(g, nx, y + 1);
+        if (below == CELL_MUD || below == CELL_GRASS) { GridSet(g, nx, y, CELL_GRASS); return; }
+    }
+}
+
+// Vines hang and grow downward from a solid/mossy ceiling (jungle flavour).
+#define VINE_MAX 12
+static void StepVine(Grid *g, int x, int y) {
+    if (GetRandomValue(0, 1000) >= 4) return;
+    int stem = 0; bool anchor = false;
+    for (int d = 1; d <= VINE_MAX; d++) {
+        if (!GridInBounds(g, x, y - d)) break;
+        Cell c = GridGet(g, x, y - d);
+        if (c == CELL_VINE) { stem++; continue; }
+        if (c == CELL_MUD || c == CELL_MOSS || c == CELL_ROCK) anchor = true;
+        break;
+    }
+    if (!anchor || stem >= VINE_MAX) return;
+    if (GridInBounds(g, x, y + 1) && GridGet(g, x, y + 1) == CELL_EMPTY)
+        GridSet(g, x, y + 1, CELL_VINE);
+}
+
+// Salt dissolves in water and melts ice/snow (depresses the freezing point).
+static bool StepSalt(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if ((c == CELL_ICE || c == CELL_SNOW) && GetRandomValue(0, 100) < 30) {
+            GridSet(g, ax, ay, CELL_WATER); GridSet(g, x, y, CELL_EMPTY); return true;
+        }
+        if (c == CELL_WATER && GetRandomValue(0, 100) < 6) { GridSet(g, x, y, CELL_EMPTY); return true; }
+    }
+    return false;
+}
+
+// Ash is the residue of fire; stirred into water it turns to mud (sludge/lye).
+static bool StepAsh(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (GridInBounds(g, ax, ay) && GridGet(g, ax, ay) == CELL_WATER &&
+            GetRandomValue(0, 100) < 5) { GridSet(g, x, y, CELL_MUD); return true; }
+    }
+    return false;
+}
+
+// Gunpowder detonates the instant it touches fire, lava or a spark.
+static bool StepGunpowder(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (c == CELL_FIRE || c == CELL_LAVA || c == CELL_SPARK) { Explode(g, x, y, 3); return true; }
+    }
+    return false;
+}
+
+// Spark = electricity. It ignites flammables, detonates gunpowder, flash-boils
+// water, and arcs along conductors (it moves into an empty cell next to one),
+// fading after a few cells.
+static bool StepSpark(Grid *g, int x, int y) {
+    int i = Idx(g, x, y);
+    bool nearCond = false;
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (Conductor(c)) nearCond = true;
+        if (c == CELL_GUNPOWDER) Explode(g, ax, ay, 3);
+        else if (c == CELL_WATER) { if (GetRandomValue(0, 100) < 2) GridSet(g, ax, ay, CELL_VAPOR); }
+        else if (Flammable(c) && GetRandomValue(0, 1000) < 400) Ignite(g, ax, ay);
+    }
+    if (g->life[i] == 0) { GridSet(g, x, y, CELL_EMPTY); return true; }
+    g->life[i]--;
+
+    // Arc along a conductor: hop into an empty neighbour (life carries over).
+    if (nearCond && GetRandomValue(0, 100) < 70) {
+        int start = GetRandomValue(0, 3);
+        for (int k = 0; k < 4; k++) {
+            int n = (start + k) & 3, ax = x + NX[n], ay = y + NY[n];
+            if (GridInBounds(g, ax, ay) && GridGet(g, ax, ay) == CELL_EMPTY) {
+                Move(g, x, y, ax, ay); return true;
+            }
+        }
+    }
+    StepGas(g, x, y, CELL_SPARK); // otherwise drift upward
+    return true;
+}
+
+// Mercury is a heavy liquid metal: it slowly dissolves gold into amalgam, and
+// near intense heat it boils off into toxic (acidic) fumes.
+static bool StepMercury(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (c == CELL_GOLD && GetRandomValue(0, 100) < 3) { GridSet(g, ax, ay, CELL_MERCURY); return false; }
+        if ((c == CELL_FIRE || c == CELL_LAVA) && GetRandomValue(0, 1000) < 8) {
+            GridSet(g, x, y, CELL_ACID_GAS); return true; // toxic mercury vapour
+        }
+    }
+    return false;
+}
+
+// Wax melts to molten wax when it touches a heat source.
+static bool StepWax(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if ((c == CELL_FIRE || c == CELL_LAVA || c == CELL_MOLTEN_GLASS) &&
+            GetRandomValue(0, 100) < 20) { GridSet(g, x, y, CELL_MOLTEN_WAX); return true; }
+    }
+    return false;
+}
+
+// Blood pools, dries up over time, and boils to smoke near intense heat.
+static bool StepBlood(Grid *g, int x, int y) {
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if ((c == CELL_FIRE || c == CELL_LAVA) && GetRandomValue(0, 100) < 20) {
+            GridSet(g, x, y, CELL_SMOKE); return true;
+        }
+    }
+    if (GetRandomValue(0, 1000) < 2) { GridSet(g, x, y, CELL_EMPTY); return true; } // dries
+    return false;
+}
+
+// Living reef: coral surrounded by water slowly encrusts adjacent sand.
+static void StepCoral(Grid *g, int x, int y) {
+    bool water = false; int sx = -1, sy = -1;
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (c == CELL_WATER) water = true;
+        else if (c == CELL_SAND) { sx = ax; sy = ay; }
+    }
+    if (water && sx >= 0 && GetRandomValue(0, 2000) < 1) GridSet(g, sx, sy, CELL_CORAL);
+}
+
+// Molten wax flows, then sets back to solid wax once it cools (or hits water).
+static bool StepMoltenWax(Grid *g, int x, int y) {
+    bool heat = false;
+    for (int n = 0; n < 4; n++) {
+        int ax = x + NX[n], ay = y + NY[n];
+        if (!GridInBounds(g, ax, ay)) continue;
+        Cell c = GridGet(g, ax, ay);
+        if (c == CELL_FIRE || c == CELL_LAVA) heat = true;
+        if (c == CELL_WATER) { GridSet(g, x, y, CELL_WAX); return true; } // chilled -> sets
+    }
+    if (!heat && GetRandomValue(0, 100) < 4) { GridSet(g, x, y, CELL_WAX); return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Frame step
 // ---------------------------------------------------------------------------
 void GridUpdate(Grid *g) {
@@ -412,7 +707,7 @@ void GridUpdate(Grid *g) {
             Cell c = g->cells[i];
             switch (c) {
                 case CELL_SAND:  StepPowder(g, x, y, c); break;
-                case CELL_WATER:
+                case CELL_WATER: if (!StepWaterChem(g, x, y)) StepLiquid(g, x, y, c); break;
                 case CELL_OIL:   StepLiquid(g, x, y, c); break;
                 case CELL_ACID:  if (!StepAcid(g, x, y)) StepLiquid(g, x, y, c); break;
                 case CELL_SNOW:  if (!StepSnow(g, x, y)) StepPowder(g, x, y, c); break;
@@ -420,10 +715,26 @@ void GridUpdate(Grid *g) {
                 case CELL_VAPOR: if (!StepVapor(g, x, y)) StepGas(g, x, y, c); break;
                 case CELL_SMOKE: if (!StepSmoke(g, x, y)) StepGas(g, x, y, c); break;
                 case CELL_GAS:   if (!StepFlammableGas(g, x, y)) StepGas(g, x, y, c); break;
+                case CELL_INERT_GAS: StepGas(g, x, y, c); break;
+                case CELL_ACID_GAS:  if (!StepAcidGas(g, x, y)) StepGas(g, x, y, c); break;
                 case CELL_LAVA:  if (!StepLava(g, x, y)) StepLiquid(g, x, y, c); break;
                 case CELL_MOLTEN_GLASS: if (!StepMoltenGlass(g, x, y)) StepLiquid(g, x, y, c); break;
                 case CELL_ICE:   StepIce(g, x, y); break;
-                default: break; // rock / mud / glass / metal / etc. are static
+                case CELL_MOSS:  StepMoss(g, x, y); break;
+                case CELL_MUD:   StepMud(g, x, y); break;
+                case CELL_GRASS: StepGrass(g, x, y); break;
+                case CELL_VINE:  StepVine(g, x, y); break;
+                case CELL_GOLD:  StepPowder(g, x, y, c); break; // gold falls under gravity
+                case CELL_SALT:  if (!StepSalt(g, x, y)) StepPowder(g, x, y, c); break;
+                case CELL_ASH:   if (!StepAsh(g, x, y)) StepPowder(g, x, y, c); break;
+                case CELL_GUNPOWDER: if (!StepGunpowder(g, x, y)) StepPowder(g, x, y, c); break;
+                case CELL_SPARK: StepSpark(g, x, y); break;
+                case CELL_MERCURY: if (!StepMercury(g, x, y)) StepLiquid(g, x, y, c); break;
+                case CELL_WAX:   StepWax(g, x, y); break;
+                case CELL_MOLTEN_WAX: if (!StepMoltenWax(g, x, y)) StepLiquid(g, x, y, c); break;
+                case CELL_BLOOD: if (!StepBlood(g, x, y)) StepLiquid(g, x, y, c); break;
+                case CELL_CORAL: StepCoral(g, x, y); break;
+                default: break; // rock / coal / glass / metal / crystal / copper are static
             }
         }
     }
@@ -442,13 +753,150 @@ static float CellRandom(int wx, int wy, unsigned int seed) {
     return ((h ^ (h >> 16)) & 0xFFFFFF) / (float)0x1000000;
 }
 
-// Is there solid rock at this world cell? Uses biome-specific frequency,
-// roughness and openness so each biome's caves actually look different.
+// Openness field, built from layered noise at three scales so big structure and
+// fine detail come from independent sources (cf. Minecraft's separated noises,
+// Noita's organic warping):
+//   * MACRO - low frequency, domain-warped: the large caverns and solid masses.
+//   * MICRO - high frequency: fine roughness on the wall surfaces.
+//   * MESO  - mid-frequency ridged noise: connected winding tunnels so caves
+//             are almost never fully sealed (ridge lines of a field connect).
+static bool IsOpen(const CaveParams *p, const BiomeInfo *bi, int wx, int wy) {
+    float s   = p->scale * (bi ? bi->scaleMul : 1.0f);
+    int   oct = ClampI(p->octaves + (bi ? bi->octaveDelta : 0), 1, 8);
+    float thr = p->threshold + (bi ? bi->opennessBias : 0.0f);
+
+    // Domain warp the macro sample so big shapes swirl instead of looking blobby.
+    float wf  = 26.0f;
+    float wxx = wx + wf * NoisePerlin2(wx * s * 0.5f + 12.3f, wy * s * 0.5f + 4.1f);
+    float wyy = wy + wf * NoisePerlin2(wx * s * 0.5f + 88.7f, wy * s * 0.5f + 51.9f);
+
+    float macro = NoiseFbm(wxx * s, wyy * s, oct);                      // big structure
+    float micro = NoiseFbm(wx * s * 4.0f + 71.0f, wy * s * 4.0f + 19.0f, 2); // fine detail
+    float field = macro * 0.80f + micro * 0.20f;
+    if (field < thr) return true;                                       // open room
+
+    float r = NoiseFbm(wx * s * 0.75f + 41.3f, wy * s * 0.75f + 17.7f, ClampI(oct - 1, 1, 8));
+    float ridge = 1.0f - fabsf(r * 2.0f - 1.0f);                        // ridged
+    return ridge > 0.86f;                                              // connected tunnel
+}
 static bool IsWall(const CaveParams *p, const BiomeInfo *bi, int wx, int wy) {
-    float scale = p->scale * (bi ? bi->scaleMul : 1.0f);
-    int   oct   = ClampI(p->octaves + (bi ? bi->octaveDelta : 0), 1, 8);
-    float thr   = p->threshold + (bi ? bi->opennessBias : 0.0f);
-    return NoiseFbm(wx * scale, wy * scale, oct) >= thr;
+    return !IsOpen(p, bi, wx, wy);
+}
+
+// Distance (in cells, 1..maxd) to the nearest wall above / below an open cell,
+// or 0 if none within range. Used for stalactites, floors and surfaces.
+static int DistUp(const CaveParams *p, const BiomeInfo *bi, int wx, int wy, int maxd) {
+    for (int d = 1; d <= maxd; d++) if (IsWall(p, bi, wx, wy - d)) return d;
+    return 0;
+}
+static int DistDown(const CaveParams *p, const BiomeInfo *bi, int wx, int wy, int maxd) {
+    for (int d = 1; d <= maxd; d++) if (IsWall(p, bi, wx, wy + d)) return d;
+    return 0;
+}
+
+// Stalactite (ceiling) / stalagmite (floor) test: deterministic per-column
+// length so the rock spikes form contiguous cones.
+static bool IsSpike(const CaveParams *p, const BiomeInfo *bi, int wx, int wy, bool ceiling) {
+    int d = ceiling ? DistUp(p, bi, wx, wy, 5) : DistDown(p, bi, wx, wy, 5);
+    if (d == 0) return false;
+    unsigned h = (unsigned)(wx * 374761393) ^ (ceiling ? 0x1111u : 0x2222u) ^ (p->seed * 9176u);
+    h ^= h >> 13; h *= 1274126177u; h ^= h >> 16;
+    if ((h & 7u) >= 3u) return false;       // only ~3/8 columns grow a spike
+    int len = 1 + (int)((h >> 8) % 4u);     // 1..4 cells long
+    return d <= len;
+}
+
+// Lined liquid bodies. A pool is the interior of a noise blob {v > hi}; the
+// ring {hi-shell < v <= hi} forms a CLOSED shell of solid containment around
+// it (the level set of a smooth field is a closed curve), so the liquid is
+// sealed in and won't leak/flood unless the player digs into it.
+//
+// Returns true and sets *out to the interior liquid or a shell solid; false if
+// this cell isn't part of this pool kind. shellA is the main lining, shellB a
+// sparse accent. The shell material is chosen so the liquid can't escape:
+//   water -> rock / wood        lava -> obsidian / copper (lava can't melt them)
+//   acid  -> glass / metal (both acid-proof)
+static bool PoolBand(int wx, int wy, float freq, float ox, float oy,
+                     float hi, float shell, Cell liquid, Cell shellA, Cell shellB,
+                     unsigned int seed, Cell *out) {
+    float v = NoiseFbm(wx * freq + ox, wy * freq + oy, 3);
+    if (v > hi) { *out = liquid; return true; }                 // interior
+    if (v > hi - shell) {                                       // containing shell
+        *out = (CellRandom(wx, wy, seed ^ 0x9E37u) < 0.18f) ? shellB : shellA;
+        return true;
+    }
+    return false;
+}
+
+static bool PoolAt(const CaveParams *p, const BiomeInfo *bi, Biome b, int wx, int wy, Cell *out) {
+    (void)bi;
+    int depth = wy;
+    unsigned int s = p->seed;
+
+    // Coral reef: riddled with water pockets walled in by coral, so the whole
+    // biome reads as a flooded reef without water leaking into its neighbours.
+    if (b == BIOME_CORAL &&
+        PoolBand(wx, wy, 0.050f, 33.0f, 17.0f, 0.60f, 0.07f,
+                 CELL_WATER, CELL_CORAL, CELL_SAND, s ^ 0xC0DEu, out)) return true;
+
+    // Ice lakes (cold biome): solid, so no shell needed.
+    if (b == BIOME_COLD) {
+        float v = NoiseFbm(wx * 0.05f + 5.0f, wy * 0.05f + 9.0f, 3);
+        if (v > 0.74f) { *out = CELL_ICE; return true; }
+    }
+    // Acid pools - glass/metal shell. Mid depth, uncommon.
+    if (depth > 40 && depth < 320 &&
+        PoolBand(wx, wy, 0.060f, 70.0f, 30.0f, 0.85f, 0.08f,
+                 CELL_ACID, CELL_GLASS, CELL_METAL, s ^ 0xAC1Du, out)) return true;
+    // Lava lakes - obsidian/copper shell. Deep only.
+    if (depth > 250 &&
+        PoolBand(wx, wy, 0.045f, 200.0f, 150.0f, 0.82f, 0.07f,
+                 CELL_LAVA, CELL_OBSIDIAN, CELL_COPPER, s ^ 0x1A33u, out)) return true;
+    // Huge oil reservoirs encased in a thick wooden shell - scattered all over
+    // (big and low-frequency). Torch the wood and the whole thing goes up.
+    if (PoolBand(wx, wy, 0.030f, 600.0f, 250.0f, 0.78f, 0.07f,
+                 CELL_OIL, CELL_WOOD, CELL_WOOD, s ^ 0x0117u, out)) return true;
+
+    // Water lakes / underwater pockets - rock/wood shell. Any depth.
+    if (PoolBand(wx, wy, 0.050f, 400.0f, 88.0f, 0.80f, 0.06f,
+                 CELL_WATER, CELL_ROCK, CELL_WOOD, s ^ 0x7711u, out)) return true;
+    return false;
+}
+
+// Material for a solid (wall) cell.
+static Cell WallMaterial(const CaveParams *p, const BiomeInfo *bi, Biome b, int wx, int wy) {
+    bool voidB = (b == BIOME_VOID);
+
+    // Rare clustered gold chambers (rarer outside the Void).
+    float chamber = NoiseFbm(wx * 0.02f + p->seed * 0.013f + 311.0f,
+                             wy * 0.02f + p->seed * 0.007f + 733.0f, 2);
+    if (chamber > (voidB ? 0.82f : 0.92f)) return CELL_GOLD;
+    if (CellRandom(wx, wy, p->seed) < 0.003f) return CELL_GOLD;   // sparse flecks
+
+    if (voidB) {
+        // Out-of-this-world: a dark obsidian shell veined with shiny copper and
+        // studded with glowing crystals.
+        if (CellRandom(wx, wy, p->seed ^ 0x51A3u) < 0.05f) return CELL_CRYSTAL;
+        float vein = NoiseFbm(wx * p->scale * 1.6f + 200.0f, wy * p->scale * 1.6f + 90.0f, 2);
+        if (vein > 0.62f) return CELL_COPPER;
+        return CELL_OBSIDIAN;
+    }
+
+    if (b == BIOME_SANDY) { // loose sand surface over solid sandstone
+        bool surface = false;
+        for (int k = 1; k <= 4 && !surface; k++)
+            if (IsOpen(p, bi, wx, wy - k)) surface = true;
+        return surface ? CELL_SAND : CELL_SANDSTONE;
+    }
+
+    // Coal seams threaded through ordinary rock (fuel for fires deep down).
+    float coal = NoiseFbm(wx * p->scale * 1.5f + 501.0f, wy * p->scale * 1.5f + 87.0f, 2);
+    if (coal > 0.74f) return CELL_COAL;
+
+    float mud = NoiseFbm(wx * p->scale * 1.8f + 100.0f, wy * p->scale * 1.8f + 100.0f, 2);
+    Cell wallA = bi ? bi->wallPrimary : CELL_ROCK;
+    Cell wallB = bi ? bi->wallSecondary : CELL_MUD;
+    return (mud > p->mudThreshold) ? wallB : wallA;
 }
 
 static Cell TerrainAt(const CaveParams *p, int wx, int wy) {
@@ -456,35 +904,40 @@ static Cell TerrainAt(const CaveParams *p, int wx, int wy) {
     Cell s = StructureSampleAt(p->seed, wx, wy);
     if (s != CELL_EMPTY) return s;
 
-    // 2) Pick the biome (with a dithered material near borders so two biomes
-    //    interleave instead of meeting at a hard line).
+    // 2) Pick the biome. Near a border, dither against the neighbouring biome
+    //    using a smooth noise so the two interleave organically (no hard line).
     const BiomeInfo *bi = NULL;
     Biome b = BIOME_ROCKY;
     if (p->biomes) {
         b = BiomeAt(wx, wy);
-        Biome bAlt = BiomeAt(wx + 4, wy + 4);
-        if (b != bAlt && (CellRandom(wx, wy, p->seed ^ 0xABCDu) < 0.5f)) b = bAlt;
+        Biome bAlt = BiomeAt(wx + 5, wy + 3);
+        if (b != bAlt && NoiseFbm(wx * 0.05f + 9.0f, wy * 0.05f + 4.0f, 2) < 0.5f) b = bAlt;
         bi = &BIOMES[b];
     }
 
-    if (!IsWall(p, bi, wx, wy)) return CELL_EMPTY;
+    // 3) Contained liquid bodies (lakes/pools) override the normal cave so
+    //    their solid shell always seals the liquid - it stays put untouched.
+    Cell pc;
+    if (PoolAt(p, bi, b, wx, wy, &pc)) return pc;
 
-    // 3) Rare glowing gold veins inside the rock.
-    if (CellRandom(wx, wy, p->seed) < 0.004f) return CELL_GOLD;
+    if (IsOpen(p, bi, wx, wy)) {
+        // Rock spikes hanging from ceilings / rising from floors.
+        if (IsSpike(p, bi, wx, wy, true) || IsSpike(p, bi, wx, wy, false)) return CELL_ROCK;
 
-    // 4) Sandy biome: loose sand on the surface, solid sandstone underneath so
-    //    it doesn't all collapse. "Surface" = open air within a few cells up.
-    if (b == BIOME_SANDY) {
-        bool surface = false;
-        for (int k = 1; k <= 4 && !surface; k++)
-            if (!IsWall(p, bi, wx, wy - k)) surface = true;
-        return surface ? CELL_SAND : CELL_SANDSTONE;
+        // Living surfaces: grass carpets mud floors; vines drape jungle ceilings.
+        if ((b == BIOME_JUNGLE || b == BIOME_OPEN) && DistDown(p, bi, wx, wy, 1) == 1) {
+            if (WallMaterial(p, bi, b, wx, wy + 1) == CELL_MUD &&
+                CellRandom(wx, wy, p->seed ^ 0x6Eu) < 0.45f)
+                return CELL_GRASS;
+        }
+        if (b == BIOME_JUNGLE && DistUp(p, bi, wx, wy, 1) == 1 &&
+            CellRandom(wx, wy, p->seed ^ 0x71u) < 0.30f)
+            return CELL_VINE;
+
+        return CELL_EMPTY;
     }
 
-    float mud = NoiseFbm(wx * p->scale * 1.8f + 100.0f, wy * p->scale * 1.8f + 100.0f, 2);
-    Cell wallA = bi ? bi->wallPrimary : CELL_ROCK;
-    Cell wallB = bi ? bi->wallSecondary : CELL_MUD;
-    return (mud > p->mudThreshold) ? wallB : wallA;
+    return WallMaterial(p, bi, b, wx, wy);
 }
 
 void GridRegenerate(Grid *g) {
@@ -621,6 +1074,45 @@ void GridDrawWorld(const Grid *g, Camera2D camera) {
                     c.r = 255;
                     c.g = ClampB(150 + (int)(80 * glow));
                     c.b = ClampB(40 + (int)(40 * glow));
+                } break;
+                case CELL_CRYSTAL: {
+                    // Glowing gemstone: pulsing cool light (emissive -> blooms).
+                    float pulse = sinf(t * 1.8f + (x * 0.7f - y * 0.5f)) * 0.5f + 0.5f;
+                    c.r = ClampB(120 + (int)(60 * pulse));
+                    c.g = ClampB(190 + (int)(50 * pulse));
+                    c.b = 255;
+                } break;
+                case CELL_COPPER: {
+                    // Metallic sheen: a moving specular streak across the ore.
+                    float spec = sinf(x * 0.9f + y * 0.5f + t * 1.5f);
+                    int s = (int)(fmaxf(spec, 0.0f) * 55.0f);
+                    c.r = ClampB(c.r + s); c.g = ClampB(c.g + s * 3 / 4); c.b = ClampB(c.b + s / 2);
+                } break;
+                case CELL_MERCURY: {
+                    // Liquid-metal silver with a sliding specular highlight.
+                    float spec = sinf(x * 0.8f + y * 0.4f + t * 2.0f);
+                    int s = (int)(fmaxf(spec, 0.0f) * 60.0f);
+                    c.r = ClampB(c.r + s); c.g = ClampB(c.g + s); c.b = ClampB(c.b + s);
+                } break;
+                case CELL_SPARK: {
+                    // Crackling electric blue-white (emissive -> blooms).
+                    int f = GetRandomValue(-45, 45);
+                    c.r = ClampB(190 + f); c.g = ClampB(225 + f); c.b = 255;
+                } break;
+                case CELL_MOLTEN_WAX: {
+                    float glow = sinf(x * 0.5f + y * 0.3f + t * 3.0f) * 0.5f + 0.5f;
+                    c.r = ClampB(c.r + (int)(25 * glow));
+                    c.g = ClampB(c.g + (int)(18 * glow));
+                } break;
+                case CELL_CORAL: {
+                    // Multi-colour reef: pick a hue per cell for a vivid look.
+                    switch (Hash(x * 3, y * 7) & 3) {
+                        case 0: c = (Color){255, 110, 150, 255}; break; // pink
+                        case 1: c = (Color){255, 150,  80, 255}; break; // orange
+                        case 2: c = (Color){180, 110, 220, 255}; break; // purple
+                        default:c = (Color){ 90, 210, 200, 255}; break; // teal
+                    }
+                    c.r = ClampB(c.r + n / 14); c.g = ClampB(c.g + n / 14); c.b = ClampB(c.b + n / 14);
                 } break;
                 case CELL_SMOKE:
                 case CELL_VAPOR: {

@@ -7,9 +7,22 @@ A real-time falling-sand / fluid simulation built with **C17**, **raylib 5.5**, 
 ### Core Simulation
 - **Infinite streaming world** — 3×3 grid of screen-sized chunks simulates around you; pan and zoom freely
 - **Persistent edits** — changes you make are saved and restored when you return to that region
-- **16+ materials** with realistic physics: wood, sand, water, lava, oil, acid, ice, snow, glass, metal, obsidian, and more
-- **Rich interactions**: fire/water/ice reactions, lava quenching, acid containment, combustion propagation
-- **Procedural caves** — Perlin noise with biome-driven variation (Open / Rocky / Sandy / Jungle / Cold / Void biomes)
+- **35+ materials** with realistic physics: wood, sand, water, lava, oil, acid, ice, snow, glass, metal, obsidian, three gases, grass, vines, copper, crystal, falling gold, salt, ash, coal, gunpowder, electric sparks, mercury, wax, and more
+- **Rich interactions**: fire/water/ice reactions, lava quenching, acid containment, combustion, freezing, plant growth, clay firing, acid dilution, explosions, electricity, dissolving, melting/setting
+- **Three gases** — flammable, inert, and corrosive (acidic) — plus condensing vapour
+- **Electricity** — sparks arc along conductors (metal, copper, gold, water, mercury), ignite fuel, detonate gunpowder, and flash-boil water
+
+### World Generation
+- **Layered, multi-scale terrain** — independent noises drive different scales: **macro** (domain-warped low frequency) shapes the big caverns/masses, **micro** (high frequency) roughens wall detail, and **meso** ridged noise carves connected winding tunnels so caves are rarely fully sealed
+- **Stalactites & stalagmites** hanging from ceilings and rising from floors
+- **Lakes & pools** — flooded underwater caverns, deep **lava lakes**, **acid pools**, and frozen **ice lakes** in cold biomes
+- **Living world** — grass **spreads across mud surfaces** (and the fresh mud worms leave), vines drape jungle ceilings, moss creeps over damp soil near water
+- **Critters** (pixel-art) — **frogs** leap through jungle biomes actively hunting **flies**; flies **multiply** over time but **disperse** so they don't clump in pits; **worms** burrow through rocky biomes, slowly **gnawing each rock into mud** over time (which grass then colonises). Kill any critter with an element (fire/lava/acid/spark…) and it spills **blood** — which then attracts more flies (carrion → predators → more blood)
+- **Out-of-this-world Void biome** — dark obsidian shot through with shiny copper veins and glowing crystals
+- **Rare gold chambers** scattered deep in the rock (gold is heavy and falls when exposed)
+- **Oil reservoirs** — huge oil pools encased in a wooden shell scattered throughout; breach or torch the wood and they gush/ignite
+- **Living coral** slowly encrusts sand underwater
+- **Procedural biomes** with softened, organic borders (Open / Rocky / Sandy / Jungle / Cold / Void)
 
 ### Visuals
 - **Post-processing shaders**: bloom glow (fire, lava, gold), water caustics, heat distortion
@@ -18,8 +31,9 @@ A real-time falling-sand / fluid simulation built with **C17**, **raylib 5.5**, 
 - **Custom font support** (falls back to built-in)
 
 ### Developer Features
-- **Structure Manager** — a dedicated menu scene (built with raygui) to browse saved structures as thumbnails and capture new ones
-- **Structure capture tool** (F2) — drag to save hand-made regions, they scatter deterministically in the world
+- **Structure Manager** — a dedicated menu scene (built with raygui) to browse saved structures as thumbnails, **delete** them, and create new ones
+- **Structure Editor** — a blank black canvas with the live simulation running; paint materials, watch them interact, see a real-time stats panel (total pixels + per-material breakdown), and save the result as a structure
+- **Structure capture tool** (F2) — in-world: drag to save hand-made regions, they scatter deterministically in the world
 - **Live cave parameter tweaking** — adjust Perlin scale, threshold, octaves, and see changes instantly
 - **Settings menu** — toggle effects (bloom, water, heat, biomes) without restarting
 - **Menu system** — intro, structures, settings, and in-game pause menu with styled buttons
@@ -51,19 +65,17 @@ Same commands; uses your system's default C compiler and OpenGL.
 ## Controls
 
 ### Materials (In-Game)
-| Key | Material |
-|---|---|
-| `1`–`9` | Sand, Water, Wood, Oil, Acid, Snow, Fire, Gas, Vapor |
-| `L` | Lava |
-| `R` | Rock / `M` Mud / `V` Glass / `B` Metal / `N` Obsidian |
-| `0` | Eraser |
+Materials are chosen from the **on-screen palette panel** (right side) — click a colour
+swatch to select it; the **Eraser** swatch (or right-click) clears cells. A slider on the
+panel sets brush size (mouse wheel also works). The HUD shows the selected material and
+your **position relative to the world origin (0,0)**.
 
 ### Interaction
 - **Left-click + drag** — paint the selected material
 - **Right-click** — erase
 - **Mouse wheel** — adjust brush size
 - **WASD / arrows** — pan the world
-- **Q / E** — zoom out / zoom in (0.34× to 16× magnification)
+- **Q / E** — zoom out / zoom in (0.18× to 16× magnification)
 - **Middle-click + drag** — pan smoothly
 
 ### Editing
@@ -94,6 +106,23 @@ Same commands; uses your system's default C compiler and OpenGL.
 | Fire + Oil/Gas | Catch quickly and burn up fast |
 | Fire + Wood/Moss | Smoulder slowly |
 | Snow + Heat | Melts to water |
+| Water surrounded by Ice/Snow (no heat) | **Freezes** to ice (phase change) |
+| Moss + adjacent Water | **Grows** onto neighbouring mud/sand (plants colonise damp soil) |
+| Mud + Fire/Lava | **Bakes** into sandstone (fired clay → ceramic) |
+| Acid + lots of Water | **Diluted/neutralised** back into water |
+| Gunpowder + Fire/Lava/Spark | **Explodes** — fireball that ignites and blasts soft matter |
+| Spark + conductor (metal/copper/gold/water/mercury) | **Arcs** along it, fading over distance |
+| Spark + Oil/Gas/Gunpowder | Ignites / detonates |
+| Spark + Water | Flash-boils to vapour |
+| Salt + Ice/Snow | **Melts** it to water (freezing-point depression) |
+| Salt / Ash + Water | Salt **dissolves**; ash becomes **mud** |
+| Mercury + Gold | Slowly **dissolves** gold into amalgam |
+| Wax + Heat | **Melts** to molten wax, which **flows then re-sets** |
+| Glass + Lava | **Re-melts** to molten glass |
+| Mercury + Fire/Lava | Boils into **toxic acid-gas** fumes |
+| Spark + Crystal | Crystals **conduct** electricity too |
+| Fire burning out | Leaves **ash**; coal burns long and hot |
+| Blood (from dead critters) | **Attracts flies** (carrion) → which draws frogs → more blood |
 
 ## Configuration
 
@@ -182,7 +211,8 @@ Each biome has a unique Perlin scale, roughness, wall materials, and background 
 | Sandy | Sand surface over Sandstone | Desert-like | Medium, with surface sand |
 | Jungle | Mud + Moss | Humid, organic | Organic, mossy accents |
 | Cold | Ice + Rock | Frozen, brittle | Smooth, icy blues |
-| Void | Rock (sparse, rare) | Vast dark chasm | Very low-frequency, massive empty spaces |
+| Void | Obsidian + Copper + Crystal | Vast dark cosmic chasm | Very low-frequency, massive empty spaces |
+| Coral | Coral + Sand | Colourful flooded reef | Dense, full of contained water pockets |
 
 ## Known Limitations & Future Ideas
 

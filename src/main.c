@@ -13,6 +13,8 @@
 #include "hud.h"
 #include "structure.h"
 #include "strmgr.h"
+#include "editor.h"
+#include "npc.h"
 #include "sim.h"
 
 #include <raymath.h>
@@ -20,13 +22,16 @@
 #include <stdio.h>
 #include <time.h>
 
-// How many screen-sized chunks to simulate across/down (3 => the chunk you're
-// in plus the 8 around it).
-#define SIM_CHUNKS 3
-#define MIN_ZOOM 0.34f   // zoomed out: shows ~the whole simulated 3x3 area
+// How many screen-sized chunks to simulate across/down. 5 => a wide 5x5 block
+// around you, so the simulation keeps running well outside the visible area.
+#define SIM_CHUNKS 5
+// MIN_ZOOM is matched so the most zoomed-out view stays within the simulated
+// buffer (no visible static/edge): 5 chunks * 160 cells * 8px = 6400px wide,
+// shown in a 1280px window => ~0.20; a touch under that to leave a margin.
+#define MIN_ZOOM 0.18f   // zoom way out and survey the whole live region
 #define MAX_ZOOM 16.0f   // zoomed in: close inspection of individual cells
 
-typedef enum AppState { STATE_MENU, STATE_SETTINGS, STATE_STRUCTURES, STATE_GAME } AppState;
+typedef enum AppState { STATE_MENU, STATE_SETTINGS, STATE_STRUCTURES, STATE_EDITOR, STATE_GAME } AppState;
 
 // Start a fresh world: new seed, recentre the camera, regenerate (clears the
 // persistence store). Caller must hold the sim lock.
@@ -38,6 +43,7 @@ static void NewGame(Grid *g, Camera2D *cam, const AppConfig *cfg) {
     g->originX = -g->width / 2;
     g->originY = -g->height / 2;
     GridRegenerate(g);
+    Npc_Reset();
 }
 
 int main(void) {
@@ -74,6 +80,7 @@ int main(void) {
     grid.originX = (int)floorf(camera.target.x / CELL_SIZE) - grid.width / 2;
     grid.originY = (int)floorf(camera.target.y / CELL_SIZE) - grid.height / 2;
     GridRegenerate(&grid);
+    Npc_Reset();
     GridSnapshot(&grid); // a valid first frame for the renderer
 
     Renderer renderer = Render_Init(&cfg);
@@ -93,12 +100,6 @@ int main(void) {
     // Structure editor (dev tool): F2 toggles; drag a rectangle to capture.
     bool devMode = false, selecting = false;
     int  sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0; // world-cell selection corners
-
-    const Cell palette[] = {
-        CELL_SAND, CELL_WATER, CELL_WOOD, CELL_OIL, CELL_ACID,
-        CELL_SNOW, CELL_FIRE, CELL_GAS, CELL_VAPOR,
-    };
-    const int paletteCount = sizeof(palette) / sizeof(palette[0]);
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
@@ -144,9 +145,24 @@ int main(void) {
             EndDrawing();
             if (a == STRMGR_BACK) { state = STATE_MENU; Audio_Play(SFX_UI); }
             else if (a == STRMGR_NEW) {
-                // Drop into the world in capture mode to make a new structure.
-                devMode = true; selecting = false; paused = false;
-                state = STATE_GAME; Audio_Play(SFX_UI);
+                // Open the dedicated blank-canvas editor.
+                Editor_Open();
+                state = STATE_EDITOR; Audio_Play(SFX_UI);
+            }
+            continue;
+        }
+
+        // --- Structure Editor (blank canvas) -----------------------------
+        if (state == STATE_EDITOR) {
+            BeginDrawing();
+            ClearBackground(BLACK);
+            EditorAction a = Editor_Run(cfg.winW, cfg.winH);
+            EndDrawing();
+            if (a == EDITOR_BACK) {
+                Editor_Close();
+                StrMgr_Refresh();
+                state = STATE_STRUCTURES;
+                Audio_Play(SFX_UI);
             }
             continue;
         }
@@ -159,7 +175,7 @@ int main(void) {
             UIAction a = Hud_DrawPause(cfg.winW, cfg.winH);
             EndDrawing();
             if (a == UI_RESUME)        { paused = false; Audio_Play(SFX_UI); }
-            else if (a == UI_NEW_SEED) { Sim_Lock(); grid.cave.seed = (unsigned)GetRandomValue(1, 1000000); GridRegenerate(&grid); GridSnapshot(&grid); Sim_Unlock(); Audio_Play(SFX_UI); }
+            else if (a == UI_NEW_SEED) { Sim_Lock(); grid.cave.seed = (unsigned)GetRandomValue(1, 1000000); GridRegenerate(&grid); Npc_Reset(); GridSnapshot(&grid); Sim_Unlock(); Audio_Play(SFX_UI); }
             else if (a == UI_CLEAR)    { Sim_Lock(); GridClear(&grid); GridSnapshot(&grid); Sim_Unlock(); Audio_Play(SFX_UI); }
             else if (a == UI_MENU)     { paused = false; devMode = false; state = STATE_MENU; Audio_Play(SFX_UI); }
             continue;
@@ -167,16 +183,9 @@ int main(void) {
 
         if (IsKeyPressed(KEY_F2)) { devMode = !devMode; selecting = false; }
 
-        // Material selection
-        for (int k = 0; k < paletteCount; k++)
-            if (IsKeyPressed(KEY_ONE + k)) selected = palette[k];
-        if (IsKeyPressed(KEY_ZERO)) selected = CELL_EMPTY;
-        if (IsKeyPressed(KEY_L))    selected = CELL_LAVA;
-        if (IsKeyPressed(KEY_R))    selected = CELL_ROCK;
-        if (IsKeyPressed(KEY_M))    selected = CELL_MUD;
-        if (IsKeyPressed(KEY_V))    selected = CELL_GLASS;
-        if (IsKeyPressed(KEY_B))    selected = CELL_METAL;
-        if (IsKeyPressed(KEY_N))    selected = CELL_OBSIDIAN;
+        // Material selection is now via the on-screen palette (Hud_DrawPalette).
+        // Suppress world painting while the cursor is over that panel.
+        bool overUI = CheckCollisionPointRec(GetMousePosition(), Hud_PaletteRect(cfg.winW, cfg.winH));
 
         // Camera
         float pan = 500.0f * dt / camera.zoom;
@@ -227,7 +236,7 @@ int main(void) {
             wcy = (int)floorf(world.y / CELL_SIZE);
 
             if (devMode) {
-                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { selecting = true; sx0 = sx1 = wcx; sy0 = sy1 = wcy; }
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !overUI) { selecting = true; sx0 = sx1 = wcx; sy0 = sy1 = wcy; }
                 if (selecting && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { sx1 = wcx; sy1 = wcy; }
                 if (selecting && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                     selecting = false;
@@ -249,15 +258,19 @@ int main(void) {
                     }
                 }
             } else {
-                brush += wheel;
+                if (!overUI) brush += wheel;
                 brush = (int)Clamp((float)brush, 0, (float)cfg.brushMax);
-                if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                if (!overUI && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                     GridPaint(&grid, wcx - grid.originX, wcy - grid.originY, brush, selected);
                     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) Audio_Play(SFX_PLACE);
                 }
-                if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+                if (!overUI && IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
                     GridPaint(&grid, wcx - grid.originX, wcy - grid.originY, brush, CELL_EMPTY);
             }
+
+            // Critters (frogs/flies) read & write the grid - keep them in the
+            // locked region. They don't run while capturing structures.
+            if (!devMode) Npc_Update(&grid, dt);
 
             // Single-threaded fallback: advance the sim ourselves.
             if (!Sim_IsThreaded() && !devMode) GridUpdate(&grid);
@@ -276,6 +289,11 @@ int main(void) {
         ClearBackground(BLACK);
         Render_Present(&renderer);
 
+        // Critters drawn in world space on top of the composited frame.
+        BeginMode2D(camera);
+        Npc_Draw();
+        EndMode2D();
+
         // Selection overlay (drawn in screen space over the composited frame).
         if (devMode && selecting) {
             int minX = sx0 < sx1 ? sx0 : sx1, maxX = sx0 > sx1 ? sx0 : sx1;
@@ -285,15 +303,19 @@ int main(void) {
             DrawRectangleLinesEx((Rectangle){a.x, a.y, b.x - a.x, b.y - a.y}, 2.0f, YELLOW);
         }
 
-        Hud_DrawGame(&grid, selected, BIOMES[biome].name, brush, camera.zoom);
+        int posX = (int)floorf(camera.target.x / CELL_SIZE);
+        int posY = (int)floorf(camera.target.y / CELL_SIZE);
+        Hud_DrawGame(&grid, selected, BIOMES[biome].name, brush, camera.zoom, posX, posY);
+        Hud_DrawPalette(&selected, &brush, cfg.brushMax, cfg.winW, cfg.winH);
         if (devMode)
             DrawText("DEV: drag to capture a structure (saved + placed on regen).  F2 to exit",
-                     10, 100, 18, YELLOW);
+                     10, 124, 18, YELLOW);
         DrawFPS(cfg.winW - 90, 10);
         EndDrawing();
     }
 
     Sim_Stop();
+    Editor_Close();
     StrMgr_Free();
     Hud_Free();
     Audio_Close();

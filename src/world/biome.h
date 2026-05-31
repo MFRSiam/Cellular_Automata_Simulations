@@ -13,6 +13,7 @@ typedef enum Biome {
     BIOME_JUNGLE,  // mossy, humid
     BIOME_COLD,    // icy
     BIOME_VOID,    // rare vast empty chasm
+    BIOME_CORAL,   // colourful flooded reef
     BIOME_COUNT,
 } Biome;
 

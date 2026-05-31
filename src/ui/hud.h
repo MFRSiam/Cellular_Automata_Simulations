@@ -32,9 +32,17 @@ MenuAction Hud_DrawMenu(int screenW, int screenH);
 // Settings screen: toggles render/biome options on `cfg`. Returns true on Back.
 bool Hud_DrawSettings(int screenW, int screenH, AppConfig *cfg);
 
-// Top overlay: selected material, biome, cave params, controls.
+// Top overlay: selected material, biome, cave params, world position, controls.
 void Hud_DrawGame(const Grid *grid, Cell selected, const char *biomeName,
-                  int brush, float zoom);
+                  int brush, float zoom, int posX, int posY);
+
+// Screen-space rectangle the material palette occupies (so the caller can
+// suppress painting while the cursor is over the UI).
+Rectangle Hud_PaletteRect(int screenW, int screenH);
+
+// Draw the clickable material palette. Updates *selected on click and *brush
+// from its slider.
+void Hud_DrawPalette(Cell *selected, int *brush, int brushMax, int screenW, int screenH);
 
 // Dimmed pause overlay with clickable buttons. Returns the chosen action.
 UIAction Hud_DrawPause(int screenW, int screenH);

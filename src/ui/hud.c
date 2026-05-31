@@ -4,8 +4,12 @@
 // font choice is centralized.
 //
 #include "hud.h"
+#include "materials.h"
+
+#include "raygui.h"
 
 #include <string.h>
+#include <math.h>
 
 static struct {
     Font  font;
@@ -47,21 +51,91 @@ static void Panel(float x, float y, float w, float h) {
 }
 
 void Hud_DrawGame(const Grid *grid, Cell selected, const char *biomeName,
-                  int brush, float zoom) {
-    Panel(8, 8, 470, 86);
+                  int brush, float zoom, int posX, int posY) {
+    Panel(8, 8, 470, 108);
     Text(TextFormat("%s", CellName(selected)), 18, 14, (float)H.size + 4, (Color){235, 240, 255, 255});
     Text(TextFormat("Biome: %s   Zoom: %.2f   Brush: %d", biomeName, zoom, brush),
          18, 40, 18, (Color){150, 200, 160, 255});
+    // Position relative to the world origin (0,0).
+    int dist = (int)sqrtf((float)posX * posX + (float)posY * posY);
+    Text(TextFormat("Pos: %d, %d   (%d from origin)", posX, posY, dist),
+         18, 62, 18, (Color){210, 190, 150, 255});
     Text(TextFormat("scale %.4f  thresh %.2f  oct %d  seed %u",
                     grid->cave.scale, grid->cave.threshold, grid->cave.octaves, grid->cave.seed),
-         18, 62, 18, (Color){150, 170, 210, 255});
+         18, 84, 18, (Color){150, 170, 210, 255});
 
     const char *help =
-        "1-9 mats  L lava R rock M mud V glass B metal N obsidian 0 erase   "
-        "WASD pan  Q/E zoom  wheel brush   [ ] scale  , . thresh   C clear   ESC menu";
+        "Pick material from the palette ->     WASD pan   Q/E zoom   wheel brush   "
+        "[ ] scale   , . thresh   G seed   C clear   F2 capture   ESC menu";
     int sw = GetScreenWidth();
     Panel(8, GetScreenHeight() - 34.0f, sw - 16.0f, 28);
     Text(help, 18, GetScreenHeight() - 30.0f, 16, (Color){190, 195, 205, 255});
+}
+
+// --- material palette -------------------------------------------------------
+// Materials offered for painting (CELL_EMPTY at the end acts as the eraser).
+static const Cell PAL[] = {
+    CELL_SAND, CELL_WATER, CELL_WOOD, CELL_OIL, CELL_ACID, CELL_SNOW,
+    CELL_FIRE, CELL_GAS, CELL_INERT_GAS, CELL_ACID_GAS, CELL_VAPOR, CELL_LAVA,
+    CELL_ROCK, CELL_MUD, CELL_SANDSTONE, CELL_ICE, CELL_MOSS, CELL_GRASS,
+    CELL_VINE, CELL_GOLD, CELL_COPPER, CELL_CRYSTAL, CELL_CORAL, CELL_GLASS,
+    CELL_METAL, CELL_OBSIDIAN, CELL_BASALT, CELL_SALT, CELL_ASH, CELL_COAL,
+    CELL_GUNPOWDER, CELL_SPARK, CELL_MERCURY, CELL_WAX, CELL_BLOOD, CELL_EMPTY,
+};
+static const int PAL_COUNT = (int)(sizeof(PAL) / sizeof(PAL[0]));
+#define PAL_COLS 4
+
+Rectangle Hud_PaletteRect(int screenW, int screenH) {
+    (void)screenH;
+    const float pw = 184.0f, pad = 12, gap = 6;
+    float sw = (pw - 2 * pad - (PAL_COLS - 1) * gap) / PAL_COLS;
+    int rows = (PAL_COUNT + PAL_COLS - 1) / PAL_COLS;
+    float ph = 34 + rows * (sw + gap) + 52;
+    return (Rectangle){ screenW - pw - 10.0f, 44.0f, pw, ph };
+}
+
+void Hud_DrawPalette(Cell *selected, int *brush, int brushMax, int screenW, int screenH) {
+    Rectangle P = Hud_PaletteRect(screenW, screenH);
+    Panel(P.x, P.y, P.width, P.height);
+    Text("MATERIALS", P.x + 12, P.y + 8, 18, (Color){235, 240, 255, 255});
+
+    const float pad = 12, gap = 6;
+    float sw = (P.width - 2 * pad - (PAL_COLS - 1) * gap) / PAL_COLS;
+    float gx = P.x + pad, gy = P.y + 34;
+    Vector2 m = GetMousePosition();
+
+    for (int i = 0; i < PAL_COUNT; i++) {
+        int cx = i % PAL_COLS, cy = i / PAL_COLS;
+        Rectangle s = { gx + cx * (sw + gap), gy + cy * (sw + gap), sw, sw };
+        Cell mat = PAL[i];
+        bool hover = CheckCollisionPointRec(m, s);
+        bool sel = (*selected == mat);
+
+        DrawRectangleRounded(s, 0.22f, 4, (Color){10, 12, 16, 255});
+        if (mat == CELL_EMPTY) {
+            Text("ERA", s.x + sw * 0.5f - 13, s.y + sw * 0.5f - 8, 15, (Color){225, 130, 130, 255});
+        } else {
+            Color col = MATERIALS[mat].color; col.a = 255;
+            DrawRectangleRounded((Rectangle){s.x + 3, s.y + 3, sw - 6, sw - 6}, 0.22f, 4, col);
+        }
+        Color border = sel ? (Color){255, 230, 120, 255}
+                           : (hover ? (Color){185, 205, 235, 255} : (Color){70, 80, 100, 160});
+        DrawRectangleRoundedLinesEx(s, 0.22f, 4, sel ? 2.5f : 1.5f, border);
+        if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) *selected = mat;
+        if (hover) { // name tooltip to the left of the panel
+            const char *nm = CellName(mat);
+            float tw = TextW(nm, 16);
+            DrawRectangleRounded((Rectangle){P.x - tw - 18, m.y - 14, tw + 12, 24}, 0.4f, 6, (Color){16, 18, 24, 230});
+            Text(nm, P.x - tw - 12, m.y - 10, 16, RAYWHITE);
+        }
+    }
+
+    int rows = (PAL_COUNT + PAL_COLS - 1) / PAL_COLS;
+    float fy = gy + rows * (sw + gap) + 6;
+    Text(TextFormat("Brush: %d", *brush), P.x + 12, fy, 16, (Color){200, 205, 215, 255});
+    float bf = (float)*brush;
+    GuiSliderBar((Rectangle){P.x + 12, fy + 22, P.width - 24, 16}, NULL, NULL, &bf, 0, (float)brushMax);
+    *brush = (int)(bf + 0.5f);
 }
 
 // Draw a button; returns true if clicked this frame.
