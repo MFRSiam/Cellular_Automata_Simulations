@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Cellular Automata sandbox configuration.
+  Edit values here and restart the app. A minimal parser reads the attributes
+  below; unknown elements/attributes are ignored, missing ones use defaults.
+-->
+<config>
+    <!-- Window + frame rate -->
+    <window width="1280" height="720" fps="60" title="Cellular Automata Sims By MFRSiam"/>
+
+    <!-- Procedural cave (Perlin noise). scale = zoom, threshold = openness. -->
+    <cave scale="0.045" threshold="0.50" mudThreshold="0.55" octaves="4" seed="0" biomes="true"/>
+
+    <!-- Post-processing. bloom/water/heat toggle the shader passes. -->
+    <render bloom="true" water="true" heat="true" vignette="0.80"/>
+
+    <!-- Audio volumes (0..1). Files live in assets/audio (none shipped yet). -->
+    <audio master="1.0" sfx="1.0" music="0.6"/>
+
+    <!-- HUD font. If the path is missing, the built-in font is used. -->
+    <font path="assets/fonts/hud.ttf" size="20"/>
+
+    <!-- Brush -->
+    <brush max="40" default="3"/>
+</config>
