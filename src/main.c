@@ -1,6 +1,7 @@
 //
 // main.c - app entry point and game loop. Wires together config, world,
-// renderer, audio, HUD and the structure editor; owns input and pause state.
+// renderer, audio, HUD, the structure editor/manager and the simulation
+// worker thread; owns input and high-level state.
 //
 #include "core.h"
 #include "config.h"
@@ -11,6 +12,8 @@
 #include "audio.h"
 #include "hud.h"
 #include "structure.h"
+#include "strmgr.h"
+#include "sim.h"
 
 #include <raymath.h>
 #include <math.h>
@@ -23,10 +26,10 @@
 #define MIN_ZOOM 0.34f   // zoomed out: shows ~the whole simulated 3x3 area
 #define MAX_ZOOM 16.0f   // zoomed in: close inspection of individual cells
 
-typedef enum AppState { STATE_MENU, STATE_SETTINGS, STATE_GAME } AppState;
+typedef enum AppState { STATE_MENU, STATE_SETTINGS, STATE_STRUCTURES, STATE_GAME } AppState;
 
 // Start a fresh world: new seed, recentre the camera, regenerate (clears the
-// persistence store).
+// persistence store). Caller must hold the sim lock.
 static void NewGame(Grid *g, Camera2D *cam, const AppConfig *cfg) {
     g->cave.biomes = cfg->biomes;
     g->cave.seed = (unsigned)GetRandomValue(1, 1000000);
@@ -71,10 +74,16 @@ int main(void) {
     grid.originX = (int)floorf(camera.target.x / CELL_SIZE) - grid.width / 2;
     grid.originY = (int)floorf(camera.target.y / CELL_SIZE) - grid.height / 2;
     GridRegenerate(&grid);
+    GridSnapshot(&grid); // a valid first frame for the renderer
 
     Renderer renderer = Render_Init(&cfg);
     Audio_Init(&cfg);
     Hud_Init(&cfg);
+    StrMgr_Init();
+
+    // Spin up the background simulation worker. If it fails to start we fall
+    // back to stepping the grid on the main thread (Sim_IsThreaded() == false).
+    Sim_Start(&grid, cfg.fps);
 
     Cell selected = CELL_SAND;
     int  brush = cfg.brushDefault;
@@ -95,15 +104,19 @@ int main(void) {
         float dt = GetFrameTime();
         Audio_Update();
 
+        // The worker only steps during active gameplay.
+        Sim_SetActive(state == STATE_GAME && !paused && !devMode);
+
         // --- Intro menu --------------------------------------------------
         if (state == STATE_MENU) {
             BeginDrawing();
             ClearBackground(BLACK);
             MenuAction a = Hud_DrawMenu(cfg.winW, cfg.winH);
             EndDrawing();
-            if (a == MENU_NEW_GAME)      { NewGame(&grid, &camera, &cfg); paused = false; state = STATE_GAME; Audio_Play(SFX_UI); }
-            else if (a == MENU_SETTINGS) { state = STATE_SETTINGS; Audio_Play(SFX_UI); }
-            else if (a == MENU_EXIT)     { break; }
+            if (a == MENU_NEW_GAME)        { Sim_Lock(); NewGame(&grid, &camera, &cfg); GridSnapshot(&grid); Sim_Unlock(); paused = false; devMode = false; state = STATE_GAME; Audio_Play(SFX_UI); }
+            else if (a == MENU_STRUCTURES) { StrMgr_Refresh(); state = STATE_STRUCTURES; Audio_Play(SFX_UI); }
+            else if (a == MENU_SETTINGS)   { state = STATE_SETTINGS; Audio_Play(SFX_UI); }
+            else if (a == MENU_EXIT)       { break; }
             continue;
         }
 
@@ -123,6 +136,21 @@ int main(void) {
             continue;
         }
 
+        // --- Structure Manager -------------------------------------------
+        if (state == STATE_STRUCTURES) {
+            BeginDrawing();
+            ClearBackground(BLACK);
+            StrMgrAction a = StrMgr_Draw(cfg.winW, cfg.winH);
+            EndDrawing();
+            if (a == STRMGR_BACK) { state = STATE_MENU; Audio_Play(SFX_UI); }
+            else if (a == STRMGR_NEW) {
+                // Drop into the world in capture mode to make a new structure.
+                devMode = true; selecting = false; paused = false;
+                state = STATE_GAME; Audio_Play(SFX_UI);
+            }
+            continue;
+        }
+
         if (IsKeyPressed(KEY_ESCAPE)) paused = !paused;
 
         if (paused) {
@@ -131,9 +159,9 @@ int main(void) {
             UIAction a = Hud_DrawPause(cfg.winW, cfg.winH);
             EndDrawing();
             if (a == UI_RESUME)        { paused = false; Audio_Play(SFX_UI); }
-            else if (a == UI_NEW_SEED) { grid.cave.seed = (unsigned)GetRandomValue(1, 1000000); GridRegenerate(&grid); Audio_Play(SFX_UI); }
-            else if (a == UI_CLEAR)    { GridClear(&grid); Audio_Play(SFX_UI); }
-            else if (a == UI_MENU)     { paused = false; state = STATE_MENU; Audio_Play(SFX_UI); }
+            else if (a == UI_NEW_SEED) { Sim_Lock(); grid.cave.seed = (unsigned)GetRandomValue(1, 1000000); GridRegenerate(&grid); GridSnapshot(&grid); Sim_Unlock(); Audio_Play(SFX_UI); }
+            else if (a == UI_CLEAR)    { Sim_Lock(); GridClear(&grid); GridSnapshot(&grid); Sim_Unlock(); Audio_Play(SFX_UI); }
+            else if (a == UI_MENU)     { paused = false; devMode = false; state = STATE_MENU; Audio_Play(SFX_UI); }
             continue;
         }
 
@@ -149,7 +177,6 @@ int main(void) {
         if (IsKeyPressed(KEY_V))    selected = CELL_GLASS;
         if (IsKeyPressed(KEY_B))    selected = CELL_METAL;
         if (IsKeyPressed(KEY_N))    selected = CELL_OBSIDIAN;
-        if (IsKeyPressed(KEY_C))    GridClear(&grid);
 
         // Camera
         float pan = 500.0f * dt / camera.zoom;
@@ -166,7 +193,7 @@ int main(void) {
             camera.target.y -= d.y / camera.zoom;
         }
 
-        // Live cave params
+        // Live cave params (decide here, regenerate under the lock below).
         bool regen = false;
         if (IsKeyPressed(KEY_LEFT_BRACKET))  { grid.cave.scale *= 0.8f;  regen = true; }
         if (IsKeyPressed(KEY_RIGHT_BRACKET)) { grid.cave.scale *= 1.25f; regen = true; }
@@ -175,60 +202,73 @@ int main(void) {
         if (IsKeyPressed(KEY_SEMICOLON))     { grid.cave.octaves--; regen = true; }
         if (IsKeyPressed(KEY_APOSTROPHE))    { grid.cave.octaves++; regen = true; }
         if (IsKeyPressed(KEY_G))             { grid.cave.seed = (unsigned)GetRandomValue(1, 1000000); regen = true; }
+        bool clear = IsKeyPressed(KEY_C);
         grid.cave.scale     = Clamp(grid.cave.scale, 0.005f, 0.3f);
         grid.cave.threshold = Clamp(grid.cave.threshold, 0.1f, 0.9f);
         grid.cave.octaves   = (int)Clamp((float)grid.cave.octaves, 1, 8);
-        if (regen) GridRegenerate(&grid);
 
-        // Stream world to follow camera
-        int nox = (int)floorf(camera.target.x / CELL_SIZE) - grid.width / 2;
-        int noy = (int)floorf(camera.target.y / CELL_SIZE) - grid.height / 2;
-        GridStreamTo(&grid, nox, noy);
+        int wcx = 0, wcy = 0;
+        int wheel = (int)GetMouseWheelMove();
 
-        // Mouse -> world cell
-        Vector2 world = GetScreenToWorld2D(GetMousePosition(), camera);
-        int wcx = (int)floorf(world.x / CELL_SIZE), wcy = (int)floorf(world.y / CELL_SIZE);
+        // All grid mutation + the render snapshot happen under the sim lock so
+        // the worker thread never sees a half-edited world. The expensive draw
+        // (Render_Frame) runs afterwards, unlocked, in parallel with the worker.
+        Sim_Lock();
+        {
+            if (regen) GridRegenerate(&grid);
+            if (clear) GridClear(&grid);
 
-        if (devMode) {
-            // Rectangle capture: drag with the left button, save on release.
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { selecting = true; sx0 = sx1 = wcx; sy0 = sy1 = wcy; }
-            if (selecting && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { sx1 = wcx; sy1 = wcy; }
-            if (selecting && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-                selecting = false;
-                int minX = sx0 < sx1 ? sx0 : sx1, maxX = sx0 > sx1 ? sx0 : sx1;
-                int minY = sy0 < sy1 ? sy0 : sy1, maxY = sy0 > sy1 ? sy0 : sy1;
-                int w = maxX - minX + 1, h = maxY - minY + 1;
-                if (w >= 1 && h >= 1 && w <= 110 && h <= 110) {
-                    Cell *buf = MemAlloc((unsigned)(w * h) * sizeof(Cell));
-                    for (int ly = 0; ly < h; ly++)
-                        for (int lx = 0; lx < w; lx++) {
-                            int bx = (minX + lx) - grid.originX, by = (minY + ly) - grid.originY;
-                            buf[ly * w + lx] = GridInBounds(&grid, bx, by) ? GridGet(&grid, bx, by) : CELL_EMPTY;
-                        }
-                    char path[512];
-                    snprintf(path, sizeof path, "%sstructures/struct_%u.txt",
-                             GetApplicationDirectory(), (unsigned)GetRandomValue(1000, 999999));
-                    if (Structure_AddAndSave(w, h, buf, path)) { GridRegenerate(&grid); Audio_Play(SFX_UI); }
-                    MemFree(buf);
+            int nox = (int)floorf(camera.target.x / CELL_SIZE) - grid.width / 2;
+            int noy = (int)floorf(camera.target.y / CELL_SIZE) - grid.height / 2;
+            GridStreamTo(&grid, nox, noy);
+
+            Vector2 world = GetScreenToWorld2D(GetMousePosition(), camera);
+            wcx = (int)floorf(world.x / CELL_SIZE);
+            wcy = (int)floorf(world.y / CELL_SIZE);
+
+            if (devMode) {
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { selecting = true; sx0 = sx1 = wcx; sy0 = sy1 = wcy; }
+                if (selecting && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) { sx1 = wcx; sy1 = wcy; }
+                if (selecting && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                    selecting = false;
+                    int minX = sx0 < sx1 ? sx0 : sx1, maxX = sx0 > sx1 ? sx0 : sx1;
+                    int minY = sy0 < sy1 ? sy0 : sy1, maxY = sy0 > sy1 ? sy0 : sy1;
+                    int w = maxX - minX + 1, h = maxY - minY + 1;
+                    if (w >= 1 && h >= 1 && w <= 110 && h <= 110) {
+                        Cell *buf = MemAlloc((unsigned)(w * h) * sizeof(Cell));
+                        for (int ly = 0; ly < h; ly++)
+                            for (int lx = 0; lx < w; lx++) {
+                                int bx = (minX + lx) - grid.originX, by = (minY + ly) - grid.originY;
+                                buf[ly * w + lx] = GridInBounds(&grid, bx, by) ? GridGet(&grid, bx, by) : CELL_EMPTY;
+                            }
+                        char path[512];
+                        snprintf(path, sizeof path, "%sstructures/struct_%u.txt",
+                                 GetApplicationDirectory(), (unsigned)GetRandomValue(1000, 999999));
+                        if (Structure_AddAndSave(w, h, buf, path)) { GridRegenerate(&grid); StrMgr_Refresh(); Audio_Play(SFX_UI); }
+                        MemFree(buf);
+                    }
                 }
+            } else {
+                brush += wheel;
+                brush = (int)Clamp((float)brush, 0, (float)cfg.brushMax);
+                if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                    GridPaint(&grid, wcx - grid.originX, wcy - grid.originY, brush, selected);
+                    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) Audio_Play(SFX_PLACE);
+                }
+                if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+                    GridPaint(&grid, wcx - grid.originX, wcy - grid.originY, brush, CELL_EMPTY);
             }
-        } else {
-            // Paint
-            brush += (int)GetMouseWheelMove();
-            brush = (int)Clamp((float)brush, 0, (float)cfg.brushMax);
-            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                GridPaint(&grid, wcx - grid.originX, wcy - grid.originY, brush, selected);
-                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) Audio_Play(SFX_PLACE);
-            }
-            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
-                GridPaint(&grid, wcx - grid.originX, wcy - grid.originY, brush, CELL_EMPTY);
+
+            // Single-threaded fallback: advance the sim ourselves.
+            if (!Sim_IsThreaded() && !devMode) GridUpdate(&grid);
+
+            GridSnapshot(&grid); // consistent copy for the renderer
         }
+        Sim_Unlock();
 
-        GridUpdate(&grid);
-
-        // Render
+        // Render (reads the snapshot; safe to run while the worker steps).
         Biome biome = grid.cave.biomes
-            ? BiomeAt(grid.originX + grid.width / 2, grid.originY + grid.height / 2)
+            ? BiomeAt(grid.rOriginX + grid.width / 2, grid.rOriginY + grid.height / 2)
             : BIOME_ROCKY;
         Render_Frame(&renderer, &grid, camera, biome);
 
@@ -253,6 +293,8 @@ int main(void) {
         EndDrawing();
     }
 
+    Sim_Stop();
+    StrMgr_Free();
     Hud_Free();
     Audio_Close();
     Render_Free(&renderer);

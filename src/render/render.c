@@ -32,9 +32,9 @@ Renderer Render_Init(const AppConfig *cfg) {
     r.ping  = LoadRenderTexture(r.w, r.h);
     r.pong  = LoadRenderTexture(r.w, r.h);
 
-    r.water = LoadShader(0, AssetPath("shaders/water.fs"));
-    r.heat  = LoadShader(0, AssetPath("shaders/heat.fs"));
-    r.bloom = LoadShader(0, AssetPath("shaders/bloom.fs"));
+    r.water = LoadShader(0, AssetPath("shaders/water.glsl"));
+    r.heat  = LoadShader(0, AssetPath("shaders/heat.glsl"));
+    r.bloom = LoadShader(0, AssetPath("shaders/bloom.glsl"));
 
     // Resolution uniform is constant; set once per shader.
     float res[2] = {(float)r.w, (float)r.h};

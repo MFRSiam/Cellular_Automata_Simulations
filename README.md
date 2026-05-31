@@ -18,18 +18,23 @@ A real-time falling-sand / fluid simulation built with **C17**, **raylib 5.5**, 
 - **Custom font support** (falls back to built-in)
 
 ### Developer Features
+- **Structure Manager** — a dedicated menu scene (built with raygui) to browse saved structures as thumbnails and capture new ones
 - **Structure capture tool** (F2) — drag to save hand-made regions, they scatter deterministically in the world
 - **Live cave parameter tweaking** — adjust Perlin scale, threshold, octaves, and see changes instantly
 - **Settings menu** — toggle effects (bloom, water, heat, biomes) without restarting
-- **Menu system** — intro, settings, and in-game pause menu with styled buttons
+- **Menu system** — intro, structures, settings, and in-game pause menu with styled buttons
+
+### Performance
+- **Multithreaded simulation** — the cellular automaton runs on a background worker thread while the main thread renders, so heavy scenes stay responsive
+- **Modern OpenGL 4.3** backend with GLSL 4.30 post-processing shaders
 
 ## Build & Run
 
 ### Prerequisites
 - **CMake** 3.21+
 - **C17** compiler (MSVC, GCC, Clang)
-- **Git** (to fetch raylib during build)
-- **OpenGL 3.3**+ capable GPU
+- **Git** (to fetch raylib + raygui during build)
+- **OpenGL 4.3**+ capable GPU
 
 ### Build (Windows Developer PowerShell)
 ```powershell
@@ -125,20 +130,38 @@ Fragment shaders in `shaders/`:
 
 ## Architecture
 
+The sources are grouped into modules by responsibility:
+
 ```
 src/
-  core.h           — shared constants & macros
-  config.{h,c}     — XML config parsing (strtol/strtod for safety)
-  noise.{h,c}      — Ken Perlin 2D gradient noise + fBm
-  materials.{h,c}  — material catalogue & properties (16 cell types)
-  biome.{h,c}      — biome classification & per-biome parameters
-  grid.{h,c}       — cellular automaton + persistent hash-map store
-  structure.{h,c}  — deterministic structure placement (dev tool)
-  render.{h,c}     — background parallax + post-processing shader pipeline
-  audio.{h,c}      — optional audio playback (graceful if no files)
-  hud.{h,c}        — styled menu, pause, settings, in-game overlay
-  main.c           — app loop: menu → game flow, chunked simulation
+  main.c             — app loop: menu/structure/game flow, input, threading
+  core/              — shared definitions & platform infrastructure
+    core.h           — shared constants & macros
+    config.{h,c}     — XML config parsing (strtol/strtod for safety)
+    thread.{h,c}     — cross-platform thread + mutex wrapper (Win32 / pthreads)
+    audio.{h,c}      — optional audio playback (graceful if no files)
+  world/             — simulation & procedural generation
+    materials.{h,c}  — material catalogue & properties
+    noise.{h,c}      — Ken Perlin 2D gradient noise + fBm
+    biome.{h,c}      — biome classification & per-biome parameters
+    grid.{h,c}       — cellular automaton + persistent hash-map store
+    structure.{h,c}  — deterministic structure placement
+    sim.{h,c}        — background simulation worker thread
+  render/
+    render.{h,c}     — background parallax + post-processing shader pipeline
+  ui/                — raygui-based interface
+    hud.{h,c}        — styled menu, pause, settings, in-game overlay
+    strmgr.{h,c}     — Structure Manager scene (browse/create, thumbnails)
+    raygui_impl.c    — raygui implementation translation unit
 ```
+
+### Threading model
+
+The simulation runs on a **background worker thread** (`world/sim.c`) while the
+main thread handles input and rendering. A mutex guards the grid: the main
+thread takes a fast snapshot under the lock, then the expensive draw + shader
+passes run unlocked, in parallel with the next simulation step. If the worker
+fails to start, the sim falls back to stepping on the main thread.
 
 ## Design Notes
 
@@ -172,9 +195,10 @@ Each biome has a unique Perlin scale, roughness, wall materials, and background 
 
 Built with:
 - **raylib 5.5** — 2D graphics and input
+- **raygui 4.0** — immediate-mode UI (Structure Manager)
 - **CMake** — cross-platform build
 - **Ken Perlin's noise** — procedural caves
-- **GLSL 330** — post-processing shaders
+- **GLSL 4.30** — post-processing shaders
 
 ---
 
