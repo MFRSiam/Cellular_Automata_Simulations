@@ -19,6 +19,11 @@ typedef struct Renderer {
     Shader water, heat, bloom;   // loaded from shaders/*.fs
     Texture2D parallax[PARALLAX_LAYERS];
     Texture2D finalTex;          // result of the last post pass (not owned)
+    // World fast path: the snapshot is converted to one texel per cell and
+    // drawn as a single scaled quad (instead of one rectangle per cell).
+    Texture2D worldTex;
+    Color    *pixels;
+    int       gw, gh;            // worldTex dimensions, in grid cells
 } Renderer;
 
 Renderer Render_Init(const AppConfig *cfg);

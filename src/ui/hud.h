@@ -44,6 +44,10 @@ Rectangle Hud_PaletteRect(int screenW, int screenH);
 // from its slider.
 void Hud_DrawPalette(Cell *selected, int *brush, int brushMax, int screenW, int screenH);
 
+// The list of paintable materials shown in palettes (last entry = eraser).
+// Shared so the in-game palette and the structure editor stay in sync.
+const Cell *Hud_PaletteList(int *count);
+
 // Dimmed pause overlay with clickable buttons. Returns the chosen action.
 UIAction Hud_DrawPause(int screenW, int screenH);
 

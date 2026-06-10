@@ -57,6 +57,7 @@ void Render_Free(Renderer *r) {
     UnloadShader(r->heat);
     UnloadShader(r->bloom);
     for (int i = 0; i < PARALLAX_LAYERS; i++) UnloadTexture(r->parallax[i]);
+    if (r->worldTex.id) { UnloadTexture(r->worldTex); MemFree(r->pixels); }
     *r = (Renderer){0};
 }
 
@@ -109,12 +110,33 @@ void Render_Frame(Renderer *r, const Grid *grid, Camera2D camera, Biome biome) {
         if (loc != -1) SetShaderValue(sh[i], loc, &time, SHADER_UNIFORM_FLOAT);
     }
 
-    // 1) Background + world into the scene target.
+    // World fast path: (re)create the cell texture if the grid size changed,
+    // then upload this frame's snapshot colours in one shot.
+    if (r->worldTex.id == 0 || r->gw != grid->width || r->gh != grid->height) {
+        if (r->worldTex.id) { UnloadTexture(r->worldTex); MemFree(r->pixels); }
+        Image img = GenImageColor(grid->width, grid->height, BLANK);
+        r->worldTex = LoadTextureFromImage(img);
+        UnloadImage(img);
+        SetTextureFilter(r->worldTex, TEXTURE_FILTER_POINT); // crisp square cells
+        r->pixels = MemAlloc((unsigned)(grid->width * grid->height) * sizeof(Color));
+        r->gw = grid->width; r->gh = grid->height;
+    }
+    GridFillPixels(grid, r->pixels, camera);
+    UpdateTexture(r->worldTex, r->pixels);
+
+    // 1) Background + world into the scene target. The whole world is ONE
+    // scaled quad - drawing cost no longer depends on zoom level.
     BeginTextureMode(r->scene);
     ClearBackground(BLACK);
     DrawParallax(r, camera, biome);
     BeginMode2D(camera);
-    GridDrawWorld(grid, camera);
+    DrawTexturePro(r->worldTex,
+                   (Rectangle){0, 0, (float)r->gw, (float)r->gh},
+                   (Rectangle){(float)(grid->rOriginX * CELL_SIZE),
+                               (float)(grid->rOriginY * CELL_SIZE),
+                               (float)(r->gw * CELL_SIZE), (float)(r->gh * CELL_SIZE)},
+                   (Vector2){0, 0}, 0.0f, WHITE);
+    GridDrawRipples(grid);
     EndMode2D();
     EndTextureMode();
 

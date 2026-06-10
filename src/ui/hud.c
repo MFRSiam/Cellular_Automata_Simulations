@@ -60,8 +60,10 @@ void Hud_DrawGame(const Grid *grid, Cell selected, const char *biomeName,
     int dist = (int)sqrtf((float)posX * posX + (float)posY * posY);
     Text(TextFormat("Pos: %d, %d   (%d from origin)", posX, posY, dist),
          18, 62, 18, (Color){210, 190, 150, 255});
-    Text(TextFormat("scale %.4f  thresh %.2f  oct %d  seed %u",
-                    grid->cave.scale, grid->cave.threshold, grid->cave.octaves, grid->cave.seed),
+    int totalTiles = grid->tilesX * grid->tilesY;
+    Text(TextFormat("scale %.4f  thresh %.2f  oct %d  seed %u  sim %d%%",
+                    grid->cave.scale, grid->cave.threshold, grid->cave.octaves, grid->cave.seed,
+                    totalTiles ? grid->activeTiles * 100 / totalTiles : 0),
          18, 84, 18, (Color){150, 170, 210, 255});
 
     const char *help =
@@ -84,6 +86,11 @@ static const Cell PAL[] = {
 };
 static const int PAL_COUNT = (int)(sizeof(PAL) / sizeof(PAL[0]));
 #define PAL_COLS 4
+
+const Cell *Hud_PaletteList(int *count) {
+    *count = PAL_COUNT;
+    return PAL;
+}
 
 Rectangle Hud_PaletteRect(int screenW, int screenH) {
     (void)screenH;

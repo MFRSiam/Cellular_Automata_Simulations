@@ -9,6 +9,30 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+
+// Installed by sim.c when the worker pool exists (see grid.h).
+void (*GridParallelFor)(int count, void (*fn)(int index, void *ud), void *ud) = NULL;
+
+// ---------------------------------------------------------------------------
+// Thread-local RNG. GridUpdateStrip runs on several threads at once; raylib's
+// global LCG would be a data race. xorshift32, lazily seeded per thread.
+// Within this file every GetRandomValue call is redirected here.
+// ---------------------------------------------------------------------------
+#ifdef _MSC_VER
+#define SIM_THREAD_LOCAL __declspec(thread)
+#else
+#define SIM_THREAD_LOCAL _Thread_local
+#endif
+static SIM_THREAD_LOCAL unsigned s_rngState = 0u;
+static int SimRand(int min, int max) {
+    unsigned x = s_rngState;
+    if (x == 0u) x = 0x9E3779B9u ^ (unsigned)(uintptr_t)&s_rngState; // per-thread seed
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    s_rngState = x;
+    return min + (int)(x % (unsigned)(max - min + 1));
+}
+#define GetRandomValue SimRand
 
 static inline CellType TypeOf(Cell c)   { return MATERIALS[c].type; }
 static inline int      DensityOf(Cell c){ return MATERIALS[c].density; }
@@ -83,6 +107,11 @@ Grid GridCreate(int windowWidth, int windowHeight) {
     g.sLife   = calloc(n, sizeof(uint8_t));
     g.rCells  = calloc(n, sizeof(Cell));
     g.rLife   = calloc(n, sizeof(uint8_t));
+    g.tilesX  = (g.width  + SIM_TILE - 1) / SIM_TILE;
+    g.tilesY  = (g.height + SIM_TILE - 1) / SIM_TILE;
+    g.tileNow  = calloc((size_t)g.tilesX * g.tilesY, 1);
+    g.tileNext = calloc((size_t)g.tilesX * g.tilesY, 1);
+    memset(g.tileNext, 1, (size_t)g.tilesX * g.tilesY); // first step: everything awake
     g.cave = (CaveParams){ .scale = 0.045f, .threshold = 0.5f, .mudThreshold = 0.55f,
                            .octaves = 4, .seed = 1337, .biomes = true };
     return g;
@@ -92,8 +121,24 @@ void GridFree(Grid *g) {
     free(g->cells); free(g->flow); free(g->life); free(g->updated);
     free(g->sCells); free(g->sFlow); free(g->sLife);
     free(g->rCells); free(g->rLife);
+    free(g->tileNow); free(g->tileNext);
     StoreFree();
     *g = (Grid){0};
+}
+
+// Wake the 3x3 tile neighbourhood around a changed cell so anything that could
+// react to the change (falling sand above, water up to its dispersion range)
+// gets processed next step.
+static inline void Wake(Grid *g, int x, int y) {
+    int tx = x / SIM_TILE, ty = y / SIM_TILE;
+    for (int j = ty - 1; j <= ty + 1; j++) {
+        if (j < 0 || j >= g->tilesY) continue;
+        for (int i = tx - 1; i <= tx + 1; i++)
+            if (i >= 0 && i < g->tilesX) g->tileNext[j * g->tilesX + i] = 1;
+    }
+}
+static void WakeAll(Grid *g) {
+    memset(g->tileNext, 1, (size_t)g->tilesX * g->tilesY);
 }
 
 void GridClear(Grid *g) {
@@ -101,6 +146,7 @@ void GridClear(Grid *g) {
     memset(g->cells, 0, n * sizeof(Cell));
     memset(g->flow,  0, n * sizeof(int8_t));
     memset(g->life,  0, n * sizeof(uint8_t));
+    WakeAll(g);
 }
 
 bool GridInBounds(const Grid *g, int x, int y) {
@@ -113,6 +159,7 @@ void GridSet(Grid *g, int x, int y, Cell mat) {
     g->cells[i] = mat;
     g->flow[i]  = 0;
     g->life[i]  = MATERIALS[mat].life;
+    Wake(g, x, y);
 }
 
 void GridPaint(Grid *g, int cx, int cy, int radius, Cell mat) {
@@ -151,6 +198,8 @@ static void Move(Grid *g, int x, int y, int nx, int ny) {
     int8_t  tf = g->flow[a];  g->flow[a]  = g->flow[b];  g->flow[b]  = tf;
     uint8_t tl = g->life[a];  g->life[a]  = g->life[b];  g->life[b]  = tl;
     g->updated[a] = g->updated[b] = 1;
+    Wake(g, x, y);
+    Wake(g, nx, ny);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +338,18 @@ static bool StepFire(Grid *g, int x, int y) {
         else if (Flammable(c)) {
             fuel++;
             // Oil & gas catch readily; solids (wood/moss) smoulder slowly.
-            int chance = (c == CELL_OIL || c == CELL_GAS) ? 120 : 18;
+            int chance = (c == CELL_OIL || c == CELL_GAS) ? 120 : 25;
             if (GetRandomValue(0, 1000) < chance) Ignite(g, ax, ay);
+        }
+    }
+
+    // Fuelled fires throw short-lived flame tongues upward, so a burning
+    // surface reads as a proper blaze instead of a thin glowing line.
+    if (fuel > 0 && GetRandomValue(0, 100) < 35) {
+        int lx = x + GetRandomValue(-1, 1);
+        if (GridInBounds(g, lx, y - 1) && GridGet(g, lx, y - 1) == CELL_EMPTY) {
+            GridSet(g, lx, y - 1, CELL_FIRE);
+            g->life[Idx(g, lx, y - 1)] = (uint8_t)GetRandomValue(8, 28); // brief tongue
         }
     }
 
@@ -321,25 +380,40 @@ static bool StepFire(Grid *g, int x, int y) {
     return true;
 }
 
+// Acid carries POTENCY in its life field (starts at MATERIALS[CELL_ACID].life).
+// Corroding a cell consumes a big chunk of potency - acid is spent by the
+// reaction, it doesn't eat forever. Touching water drains potency gradually
+// (dilution); only when fully drained does the cell become plain water.
+// The render tints acid paler as it weakens, so you can SEE it dying.
 static bool StepAcid(Grid *g, int x, int y) {
+    int i = Idx(g, x, y);
     int water = 0;
     for (int n = 0; n < 4; n++) {
         int ax = x + NX[n], ay = y + NY[n];
         if (!GridInBounds(g, ax, ay)) continue;
         Cell c = GridGet(g, ax, ay);
-        if (c == CELL_WATER) water++;
+        if (c == CELL_WATER) { water++; continue; }
         CellType t = TypeOf(c);
         // Eats solids/powders, but acid-proof materials (glass, metal,
         // obsidian) contain it instead.
         if ((t == TYPE_SOLID || t == TYPE_POWDER) && !MATERIALS[c].acidProof &&
             GetRandomValue(0, 100) < 8) {
-            GridSet(g, ax, ay, CELL_EMPTY);
-            if (GetRandomValue(0, 100) < 30) { GridSet(g, x, y, CELL_EMPTY); return true; }
+            GridSet(g, ax, ay, GetRandomValue(0, 100) < 20 ? CELL_ACID_GAS : CELL_EMPTY);
+            const int cost = 60; // the reaction consumes the acid itself
+            if (g->life[i] <= cost) {
+                GridSet(g, x, y, GetRandomValue(0, 3) ? CELL_EMPTY : CELL_ACID_GAS); // spent
+                return true;
+            }
+            g->life[i] -= cost;
         }
     }
-    // Dilution: water neutralises acid into (harmless) water - the more water
-    // touching it, the faster it dilutes. Pour water on acid to wash it away.
-    if (water > 0 && GetRandomValue(0, 100) < water * 5) { GridSet(g, x, y, CELL_WATER); return true; }
+    // Dilution: each adjacent water steadily saps potency; fully drained acid
+    // becomes water instead of flipping instantly.
+    if (water > 0) {
+        int drain = water * 2;
+        if (g->life[i] <= drain) { GridSet(g, x, y, CELL_WATER); return true; }
+        g->life[i] = (uint8_t)(g->life[i] - drain);
+    }
     return false;
 }
 
@@ -396,17 +470,20 @@ static bool StepLava(Grid *g, int x, int y) {
             SpawnRipple(g, x, y);
             return true;
         }
-        if (c == CELL_ICE)  { GridSet(g, ax, ay, CELL_WATER); }          // melt ice
-        if (c == CELL_SAND || c == CELL_GLASS) { GridSet(g, ax, ay, CELL_MOLTEN_GLASS); } // (re)melt to glass
-        if (c == CELL_WAX)  { GridSet(g, ax, ay, CELL_MOLTEN_WAX); }      // melt wax
-        // Lava slowly melts ordinary rock back into lava (not metal/obsidian).
+        // Everything lava melts, melts over TIME - heat takes a while to soak in.
+        if (c == CELL_ICE   && GetRandomValue(0, 1000) < 150) GridSet(g, ax, ay, CELL_WATER);
+        if (c == CELL_SAND  && GetRandomValue(0, 1000) < 50)  GridSet(g, ax, ay, CELL_MOLTEN_GLASS);
+        if (c == CELL_GLASS && GetRandomValue(0, 1000) < 5)   GridSet(g, ax, ay, CELL_MOLTEN_GLASS);
+        if (c == CELL_WAX   && GetRandomValue(0, 1000) < 40)  GridSet(g, ax, ay, CELL_MOLTEN_WAX);
+        // Rock erodes back into lava VERY slowly - a lava pocket gnaws at its
+        // surroundings over minutes, it doesn't tunnel.
         if ((c == CELL_ROCK || c == CELL_MUD || c == CELL_SANDSTONE || c == CELL_BASALT) &&
-            GetRandomValue(0, 1000) < 3) GridSet(g, ax, ay, CELL_LAVA);
+            GetRandomValue(0, 4000) < 1) GridSet(g, ax, ay, CELL_LAVA);
         if (Flammable(c) && GetRandomValue(0, 1000) < 40) Ignite(g, ax, ay);
     }
     // Only cools to obsidian when its surface is exposed to air; lava sealed
     // inside its shell (e.g. a contained lava lake) stays molten.
-    if (hasAir && GetRandomValue(0, 2000) < 2) { GridSet(g, x, y, CELL_OBSIDIAN); return true; }
+    if (hasAir && GetRandomValue(0, 2000) < 6) { GridSet(g, x, y, CELL_OBSIDIAN); return true; }
     return false;
 }
 
@@ -449,7 +526,7 @@ static bool StepWaterChem(Grid *g, int x, int y) {
         if (c == CELL_ICE || c == CELL_SNOW) cold++;
         else if (c == CELL_FIRE || c == CELL_LAVA || c == CELL_MOLTEN_GLASS) heat++;
     }
-    if (heat == 0 && cold >= 2 && GetRandomValue(0, 1000) < 5) { GridSet(g, x, y, CELL_ICE); return true; }
+    if (heat == 0 && cold >= 2 && GetRandomValue(0, 1000) < 15) { GridSet(g, x, y, CELL_ICE); return true; }
     return false;
 }
 
@@ -461,7 +538,7 @@ static void StepMoss(Grid *g, int x, int y) {
         int ax = x + NX[n], ay = y + NY[n];
         if (GridInBounds(g, ax, ay) && GridGet(g, ax, ay) == CELL_WATER) { water = true; break; }
     }
-    if (!water || GetRandomValue(0, 1000) >= 4) return;
+    if (!water || GetRandomValue(0, 1000) >= 20) return; // tuned for sleeping tiles
     int start = GetRandomValue(0, 3);
     for (int k = 0; k < 4; k++) {
         int n = (start + k) & 3;
@@ -487,7 +564,8 @@ static void StepMud(Grid *g, int x, int y) {
 }
 
 // Acidic gas: a corrosive vapour. Eats adjacent non-acid-proof matter (like
-// acid, but airborne) and slowly dissipates. Caller still runs StepGas.
+// acid, but airborne) - and like acid, the reaction CONSUMES the gas. It also
+// slowly dissipates on its own. Caller still runs StepGas.
 static bool StepAcidGas(Grid *g, int x, int y) {
     for (int n = 0; n < 4; n++) {
         int ax = x + NX[n], ay = y + NY[n];
@@ -495,8 +573,10 @@ static bool StepAcidGas(Grid *g, int x, int y) {
         Cell c = GridGet(g, ax, ay);
         CellType t = TypeOf(c);
         if ((t == TYPE_SOLID || t == TYPE_POWDER) && !MATERIALS[c].acidProof &&
-            GetRandomValue(0, 100) < 3)
+            GetRandomValue(0, 100) < 3) {
             GridSet(g, ax, ay, CELL_EMPTY);
+            if (GetRandomValue(0, 100) < 40) { GridSet(g, x, y, CELL_EMPTY); return true; } // spent
+        }
     }
     if (GetRandomValue(0, 1000) < 2) { GridSet(g, x, y, CELL_EMPTY); return true; } // dissipate
     return false;
@@ -506,7 +586,9 @@ static bool StepAcidGas(Grid *g, int x, int y) {
 // surfaces (so it carpets the ground, including fresh mud left by worms).
 #define GRASS_MAX 5
 static void StepGrass(Grid *g, int x, int y) {
-    if (GetRandomValue(0, 1000) >= 6) return;
+    // Probability tuned for sleeping tiles: settled areas are only evaluated on
+    // the ambient wake (~4% of steps), so the per-evaluation chance is higher.
+    if (GetRandomValue(0, 1000) >= 30) return;
 
     // Must be rooted: walk down through any grass stem to mud.
     int stem = 0; bool soil = false;
@@ -539,7 +621,7 @@ static void StepGrass(Grid *g, int x, int y) {
 // Vines hang and grow downward from a solid/mossy ceiling (jungle flavour).
 #define VINE_MAX 12
 static void StepVine(Grid *g, int x, int y) {
-    if (GetRandomValue(0, 1000) >= 4) return;
+    if (GetRandomValue(0, 1000) >= 20) return; // tuned for sleeping tiles
     int stem = 0; bool anchor = false;
     for (int d = 1; d <= VINE_MAX; d++) {
         if (!GridInBounds(g, x, y - d)) break;
@@ -671,7 +753,7 @@ static void StepCoral(Grid *g, int x, int y) {
         if (c == CELL_WATER) water = true;
         else if (c == CELL_SAND) { sx = ax; sy = ay; }
     }
-    if (water && sx >= 0 && GetRandomValue(0, 2000) < 1) GridSet(g, sx, sy, CELL_CORAL);
+    if (water && sx >= 0 && GetRandomValue(0, 2000) < 5) GridSet(g, sx, sy, CELL_CORAL);
 }
 
 // Molten wax flows, then sets back to solid wax once it cools (or hits water).
@@ -691,21 +773,12 @@ static bool StepMoltenWax(Grid *g, int x, int y) {
 // ---------------------------------------------------------------------------
 // Frame step
 // ---------------------------------------------------------------------------
-void GridUpdate(Grid *g) {
-    static int frame = 0;
-    frame++;
-    memset(g->updated, 0, (size_t)g->width * g->height);
-    bool ltr = (frame % 2 == 0);
-
-    for (int y = g->height - 1; y >= 0; y--) {
-        int startX = ltr ? 0 : g->width - 1;
-        int endX   = ltr ? g->width : -1;
-        int stepX  = ltr ? 1 : -1;
-        for (int x = startX; x != endX; x += stepX) {
-            int i = Idx(g, x, y);
-            if (g->updated[i]) continue;
-            Cell c = g->cells[i];
-            switch (c) {
+// One simulation step for the cell at (x,y).
+static void StepCell(Grid *g, int x, int y) {
+    int i = Idx(g, x, y);
+    if (g->updated[i]) return;
+    Cell c = g->cells[i];
+    switch (c) {
                 case CELL_SAND:  StepPowder(g, x, y, c); break;
                 case CELL_WATER: if (!StepWaterChem(g, x, y)) StepLiquid(g, x, y, c); break;
                 case CELL_OIL:   StepLiquid(g, x, y, c); break;
@@ -735,10 +808,66 @@ void GridUpdate(Grid *g) {
                 case CELL_BLOOD: if (!StepBlood(g, x, y)) StepLiquid(g, x, y, c); break;
                 case CELL_CORAL: StepCoral(g, x, y); break;
                 default: break; // rock / coal / glass / metal / crystal / copper are static
+    }
+}
+
+void GridUpdatePrepare(Grid *g) {
+    g->frame++;
+    memset(g->updated, 0, (size_t)g->width * g->height);
+
+    // Rotate tile activity: tiles woken last step are processed now; changes
+    // made during this step wake tiles for the next one.
+    size_t nTiles = (size_t)g->tilesX * g->tilesY;
+    memcpy(g->tileNow, g->tileNext, nTiles);
+    memset(g->tileNext, 0, nTiles);
+
+    // Ambient tick: wake a few random tiles so slow background processes
+    // (grass/moss/coral growth, lava cooling) continue in settled areas.
+    int ambient = (int)(nTiles / 25) + 1; // ~4% of tiles per step
+    for (int k = 0; k < ambient; k++)
+        g->tileNow[GetRandomValue(0, (int)nTiles - 1)] = 1;
+
+    int awake = 0;
+    for (size_t k = 0; k < nTiles; k++) awake += g->tileNow[k];
+    g->activeTiles = awake;
+}
+
+// Process the column range [x0,x1), bottom-up, honouring tile activity and the
+// per-frame scan direction. Safe to call concurrently for ranges separated by
+// an unprocessed strip wider than the maximum interaction reach (~7 cells).
+void GridUpdateStrip(Grid *g, int x0, int x1) {
+    bool ltr = (g->frame % 2 == 0);
+    int t0 = x0 / SIM_TILE, t1 = (x1 - 1) / SIM_TILE;
+
+    for (int y = g->height - 1; y >= 0; y--) {
+        const uint8_t *rowTiles = &g->tileNow[(y / SIM_TILE) * g->tilesX];
+        if (ltr) {
+            for (int tx = t0; tx <= t1; tx++) {
+                if (!rowTiles[tx]) continue;
+                int a = tx * SIM_TILE;       if (a < x0) a = x0;
+                int b = (tx + 1) * SIM_TILE; if (b > x1) b = x1;
+                for (int x = a; x < b; x++) StepCell(g, x, y);
+            }
+        } else {
+            for (int tx = t1; tx >= t0; tx--) {
+                if (!rowTiles[tx]) continue;
+                int a = tx * SIM_TILE;       if (a < x0) a = x0;
+                int b = (tx + 1) * SIM_TILE; if (b > x1) b = x1;
+                for (int x = b - 1; x >= a; x--) StepCell(g, x, y);
             }
         }
     }
+}
+
+void GridUpdateFinish(Grid *g) {
     UpdateRipples(g);
+}
+
+// Serial fallback (used by the editor's small canvas).
+void GridUpdate(Grid *g) {
+    GridUpdatePrepare(g);
+    GridUpdateStrip(g, 0, g->width);
+    GridUpdateFinish(g);
 }
 
 // ---------------------------------------------------------------------------
@@ -753,220 +882,366 @@ static float CellRandom(int wx, int wy, unsigned int seed) {
     return ((h ^ (h >> 16)) & 0xFFFFFF) / (float)0x1000000;
 }
 
-// Openness field, built from layered noise at three scales so big structure and
-// fine detail come from independent sources (cf. Minecraft's separated noises,
-// Noita's organic warping):
-//   * MACRO - low frequency, domain-warped: the large caverns and solid masses.
-//   * MICRO - high frequency: fine roughness on the wall surfaces.
-//   * MESO  - mid-frequency ridged noise: connected winding tunnels so caves
-//             are almost never fully sealed (ridge lines of a field connect).
+static int FloorDivI(int a, int b) { int q = a / b; if ((a % b) && ((a < 0) != (b < 0))) q--; return q; }
+
+// Openness field, tuned for a Noita-like silhouette: the BASE field is very
+// smooth (low frequency, 2 octaves, no per-cell roughness at all) and ALL the
+// character comes from a two-stage domain warp - a big sweeping distortion
+// followed by a smaller swirl. That combination produces long flowing rock
+// edges, overhangs and tongues instead of crumbly noise, while the boundary
+// itself stays clean and smooth.
 static bool IsOpen(const CaveParams *p, const BiomeInfo *bi, int wx, int wy) {
     float s   = p->scale * (bi ? bi->scaleMul : 1.0f);
-    int   oct = ClampI(p->octaves + (bi ? bi->octaveDelta : 0), 1, 8);
+    int   oct = ClampI(p->octaves + (bi ? bi->octaveDelta : 0), 2, 3); // keep it smooth
     float thr = p->threshold + (bi ? bi->opennessBias : 0.0f);
 
-    // Domain warp the macro sample so big shapes swirl instead of looking blobby.
-    float wf  = 26.0f;
-    float wxx = wx + wf * NoisePerlin2(wx * s * 0.5f + 12.3f, wy * s * 0.5f + 4.1f);
-    float wyy = wy + wf * NoisePerlin2(wx * s * 0.5f + 88.7f, wy * s * 0.5f + 51.9f);
+    // Frequency discipline (at the default scale 0.045):
+    //   base wavelength ~140 cells - one cavern is a real place, not a pore
+    //   warp amplitudes stay well under 1/3 of the base wavelength; pushing
+    //   them past it folds the field over itself and SHREDS the terrain into
+    //   slivers (the jagged-crack artifact).
+    // Stage 1: huge gentle sweep - bends whole formations.
+    float ax = wx + 36.0f * NoisePerlin2(wx * s * 0.06f + 12.3f, wy * s * 0.06f + 4.1f);
+    float ay = wy + 36.0f * NoisePerlin2(wx * s * 0.06f + 88.7f, wy * s * 0.06f + 51.9f);
+    // Stage 2: small swirl at the warped point - curls the edges.
+    float bx = ax + 10.0f * NoisePerlin2(ax * s * 0.32f + 7.7f,  ay * s * 0.32f + 21.4f);
+    float by = ay + 10.0f * NoisePerlin2(ax * s * 0.32f + 63.1f, ay * s * 0.32f + 5.8f);
 
-    float macro = NoiseFbm(wxx * s, wyy * s, oct);                      // big structure
-    float micro = NoiseFbm(wx * s * 4.0f + 71.0f, wy * s * 4.0f + 19.0f, 2); // fine detail
-    float field = macro * 0.80f + micro * 0.20f;
-    if (field < thr) return true;                                       // open room
+    // Smooth anisotropic base: caverns wider than tall (walkable floors).
+    float field = NoiseFbm(bx * s * 0.16f, by * s * 0.28f, oct);
 
-    float r = NoiseFbm(wx * s * 0.75f + 41.3f, wy * s * 0.75f + 17.7f, ClampI(oct - 1, 1, 8));
-    float ridge = 1.0f - fabsf(r * 2.0f - 1.0f);                        // ridged
-    return ridge > 0.86f;                                              // connected tunnel
+    float depth = (float)wy * 0.00040f;                       // strata: airy top,
+    field += depth < -0.08f ? -0.08f : (depth > 0.14f ? 0.14f : depth); // dense deep
+
+    if (field < thr) return true;
+
+    // ONE broad corridor system + very sparse narrow connectors. Corridors are
+    // a feature you find, not a texture smeared over the rock.
+    float r1 = NoiseFbm(wx * s * 0.22f + 41.3f, wy * s * 0.45f + 17.7f, 2);
+    if (1.0f - fabsf(r1 * 2.0f - 1.0f) > 0.82f && field < thr + 0.20f) return true;
+    float r2 = NoiseFbm(wx * s * 0.55f + 191.0f, wy * s * 0.80f + 67.0f, 2);
+    return (1.0f - fabsf(r2 * 2.0f - 1.0f) > 0.94f) && field < thr + 0.10f;
 }
-static bool IsWall(const CaveParams *p, const BiomeInfo *bi, int wx, int wy) {
-    return !IsOpen(p, bi, wx, wy);
-}
+// --- cached generation fields ------------------------------------------------
+// GenRegion (below) samples biome + openness ONCE per cell into temp arrays
+// with GEN_VMARGIN extra rows above/below, so all the vertical probes
+// (stalactites, surface detection, plant anchors) are array reads instead of
+// repeated noise evaluation. This is the difference between a regen costing
+// ~40 noise calls per cell and ~12.
+#define GEN_VMARGIN 8
 
-// Distance (in cells, 1..maxd) to the nearest wall above / below an open cell,
-// or 0 if none within range. Used for stalactites, floors and surfaces.
-static int DistUp(const CaveParams *p, const BiomeInfo *bi, int wx, int wy, int maxd) {
-    for (int d = 1; d <= maxd; d++) if (IsWall(p, bi, wx, wy - d)) return d;
+// open[] is indexed [(ly + GEN_VMARGIN) * w + lx] for ly in [-MARGIN, h+MARGIN).
+static inline bool COpen(const uint8_t *open, int w, int lx, int ly) {
+    return open[(ly + GEN_VMARGIN) * w + lx] != 0;
+}
+static int CDistUp(const uint8_t *open, int w, int lx, int ly, int maxd) {
+    for (int d = 1; d <= maxd; d++) if (!COpen(open, w, lx, ly - d)) return d;
     return 0;
 }
-static int DistDown(const CaveParams *p, const BiomeInfo *bi, int wx, int wy, int maxd) {
-    for (int d = 1; d <= maxd; d++) if (IsWall(p, bi, wx, wy + d)) return d;
+static int CDistDown(const uint8_t *open, int w, int lx, int ly, int maxd) {
+    for (int d = 1; d <= maxd; d++) if (!COpen(open, w, lx, ly + d)) return d;
     return 0;
 }
 
 // Stalactite (ceiling) / stalagmite (floor) test: deterministic per-column
 // length so the rock spikes form contiguous cones.
-static bool IsSpike(const CaveParams *p, const BiomeInfo *bi, int wx, int wy, bool ceiling) {
-    int d = ceiling ? DistUp(p, bi, wx, wy, 5) : DistDown(p, bi, wx, wy, 5);
+static bool CSpike(unsigned int seed, const uint8_t *open, int w, int lx, int ly,
+                   int wx, bool ceiling) {
+    int d = ceiling ? CDistUp(open, w, lx, ly, GEN_VMARGIN) : CDistDown(open, w, lx, ly, GEN_VMARGIN);
     if (d == 0) return false;
-    unsigned h = (unsigned)(wx * 374761393) ^ (ceiling ? 0x1111u : 0x2222u) ^ (p->seed * 9176u);
+    unsigned h = (unsigned)(wx * 374761393) ^ (ceiling ? 0x1111u : 0x2222u) ^ (seed * 9176u);
     h ^= h >> 13; h *= 1274126177u; h ^= h >> 16;
-    if ((h & 7u) >= 3u) return false;       // only ~3/8 columns grow a spike
-    int len = 1 + (int)((h >> 8) % 4u);     // 1..4 cells long
+    if ((h & 7u) >= 2u) return false;       // ~1 in 4 columns grows a spike
+    int len = 2 + (int)((h >> 8) % 6u);     // 2..7 cells long - reads as a cone
     return d <= len;
 }
 
-// Lined liquid bodies. A pool is the interior of a noise blob {v > hi}; the
-// ring {hi-shell < v <= hi} forms a CLOSED shell of solid containment around
-// it (the level set of a smooth field is a closed curve), so the liquid is
-// sealed in and won't leak/flood unless the player digs into it.
-//
-// Returns true and sets *out to the interior liquid or a shell solid; false if
-// this cell isn't part of this pool kind. shellA is the main lining, shellB a
-// sparse accent. The shell material is chosen so the liquid can't escape:
-//   water -> rock / wood        lava -> obsidian / copper (lava can't melt them)
-//   acid  -> glass / metal (both acid-proof)
-static bool PoolBand(int wx, int wy, float freq, float ox, float oy,
-                     float hi, float shell, Cell liquid, Cell shellA, Cell shellB,
-                     unsigned int seed, Cell *out) {
-    float v = NoiseFbm(wx * freq + ox, wy * freq + oy, 3);
-    if (v > hi) { *out = liquid; return true; }                 // interior
-    if (v > hi - shell) {                                       // containing shell
-        *out = (CellRandom(wx, wy, seed ^ 0x9E37u) < 0.18f) ? shellB : shellA;
-        return true;
-    }
-    return false;
-}
-
+// Contained liquid pockets, ANCHORED per region instead of stamped from a
+// global band field. The world is divided into POOL_REG x POOL_REG regions;
+// each region's hash decides whether it hosts one pocket, where, how big, and
+// (by depth + biome) what's inside. Pockets are lens-shaped (wider than tall,
+// like real ponds), with an organic wobbled edge. Interior and shell use the
+// SAME wobbled distance, so the 3-cell shell is always closed - nothing leaks
+// until the player digs in.
+//   water -> rock/mud shell      oil  -> wood shell (torch it...)
+//   acid  -> glass/metal shell   lava -> obsidian/copper shell
+//   deep gold pockets -> rock shell (sealed treasure; gold pours out when cut)
+#define POOL_REG 96
 static bool PoolAt(const CaveParams *p, const BiomeInfo *bi, Biome b, int wx, int wy, Cell *out) {
     (void)bi;
-    int depth = wy;
-    unsigned int s = p->seed;
+    int rx = FloorDivI(wx, POOL_REG), ry = FloorDivI(wy, POOL_REG);
+    unsigned h = ((unsigned)rx * 73856093u) ^ ((unsigned)ry * 19349663u) ^ (p->seed * 83492791u);
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    if ((h % 100u) >= 30u) return false;          // ~30% of regions host a pocket
 
-    // Coral reef: riddled with water pockets walled in by coral, so the whole
-    // biome reads as a flooded reef without water leaking into its neighbours.
-    if (b == BIOME_CORAL &&
-        PoolBand(wx, wy, 0.050f, 33.0f, 17.0f, 0.60f, 0.07f,
-                 CELL_WATER, CELL_CORAL, CELL_SAND, s ^ 0xC0DEu, out)) return true;
+    int cx = rx * POOL_REG + POOL_REG / 2 + (int)((h >> 8)  % 17u) - 8;
+    int cy = ry * POOL_REG + POOL_REG / 2 + (int)((h >> 12) % 17u) - 8;
+    int radius = 9 + (int)((h >> 16) % 9u);       // 9..17 cells wide
+    const int shell = 3;
 
-    // Ice lakes (cold biome): solid, so no shell needed.
-    if (b == BIOME_COLD) {
-        float v = NoiseFbm(wx * 0.05f + 5.0f, wy * 0.05f + 9.0f, 3);
-        if (v > 0.74f) { *out = CELL_ICE; return true; }
+    int dx = wx - cx, dy = wy - cy;
+    int bound = radius + shell + 4;
+    if (dx * dx + dy * dy > bound * bound) return false;    // cheap reject
+
+    // Lens metric (y squashed) + organic wobble shared by interior AND shell.
+    float d = sqrtf((float)(dx * dx) + (float)(dy * dy) * 2.2f)
+            + NoisePerlin2(wx * 0.13f + 7.0f, wy * 0.13f + 3.0f) * 2.0f;
+    if (d > radius + shell) return false;
+
+    // Contents by biome and the POCKET's depth (cy), so the whole pocket agrees.
+    Cell liq, sh1, sh2;
+    unsigned pick = (h >> 20) & 7u;
+    if (b == BIOME_CORAL)     { liq = CELL_WATER; sh1 = CELL_CORAL;    sh2 = CELL_CORAL; }
+    else if (b == BIOME_COLD) { liq = CELL_WATER; sh1 = CELL_ICE;      sh2 = CELL_ICE;   }
+    else if (cy > 280) {      // deep: lava lakes, sealed gold, oil
+        if (pick < 4)         { liq = CELL_LAVA;  sh1 = CELL_OBSIDIAN; sh2 = CELL_COPPER; }
+        else if (pick < 6)    { liq = CELL_GOLD;  sh1 = CELL_ROCK;     sh2 = CELL_ROCK;   }
+        else                  { liq = CELL_OIL;   sh1 = CELL_WOOD;     sh2 = CELL_WOOD;   }
+    } else if (cy > 80) {     // mid: water, oil, acid
+        if (pick < 3)         { liq = CELL_WATER; sh1 = CELL_ROCK;     sh2 = CELL_MUD;    }
+        else if (pick < 6)    { liq = CELL_OIL;   sh1 = CELL_WOOD;     sh2 = CELL_WOOD;   }
+        else                  { liq = CELL_ACID;  sh1 = CELL_GLASS;    sh2 = CELL_METAL;  }
+    } else {                  // surface band: ponds, the odd oil cache
+        if (pick < 5)         { liq = CELL_WATER; sh1 = CELL_ROCK;     sh2 = CELL_MUD;    }
+        else                  { liq = CELL_OIL;   sh1 = CELL_WOOD;     sh2 = CELL_WOOD;   }
     }
-    // Acid pools - glass/metal shell. Mid depth, uncommon.
-    if (depth > 40 && depth < 320 &&
-        PoolBand(wx, wy, 0.060f, 70.0f, 30.0f, 0.85f, 0.08f,
-                 CELL_ACID, CELL_GLASS, CELL_METAL, s ^ 0xAC1Du, out)) return true;
-    // Lava lakes - obsidian/copper shell. Deep only.
-    if (depth > 250 &&
-        PoolBand(wx, wy, 0.045f, 200.0f, 150.0f, 0.82f, 0.07f,
-                 CELL_LAVA, CELL_OBSIDIAN, CELL_COPPER, s ^ 0x1A33u, out)) return true;
-    // Huge oil reservoirs encased in a thick wooden shell - scattered all over
-    // (big and low-frequency). Torch the wood and the whole thing goes up.
-    if (PoolBand(wx, wy, 0.030f, 600.0f, 250.0f, 0.78f, 0.07f,
-                 CELL_OIL, CELL_WOOD, CELL_WOOD, s ^ 0x0117u, out)) return true;
 
-    // Water lakes / underwater pockets - rock/wood shell. Any depth.
-    if (PoolBand(wx, wy, 0.050f, 400.0f, 88.0f, 0.80f, 0.06f,
-                 CELL_WATER, CELL_ROCK, CELL_WOOD, s ^ 0x7711u, out)) return true;
-    return false;
+    if (d <= radius) *out = liq;
+    else             *out = (CellRandom(wx, wy, p->seed ^ 0x9E37u) < 0.15f) ? sh2 : sh1;
+    return true;
 }
 
-// Material for a solid (wall) cell.
-static Cell WallMaterial(const CaveParams *p, const BiomeInfo *bi, Biome b, int wx, int wy) {
-    bool voidB = (b == BIOME_VOID);
-
-    // Rare clustered gold chambers (rarer outside the Void).
-    float chamber = NoiseFbm(wx * 0.02f + p->seed * 0.013f + 311.0f,
-                             wy * 0.02f + p->seed * 0.007f + 733.0f, 2);
-    if (chamber > (voidB ? 0.82f : 0.92f)) return CELL_GOLD;
-    if (CellRandom(wx, wy, p->seed) < 0.003f) return CELL_GOLD;   // sparse flecks
-
-    if (voidB) {
-        // Out-of-this-world: a dark obsidian shell veined with shiny copper and
+// Material for a solid (wall) cell. `open/w/lx/ly` give cached-field access for
+// the surface probes. Layered like a real cross-section:
+//   top-soil  - a biome cover on any wall just under open air (mud / sand /
+//               snow-over-ice), so floors look dressed and plants can root
+//   veins     - elongated ridged streaks of ore: coal shallow, copper mid,
+//               gold deep (gold pours out when you cut a vein - it's a powder)
+//   strata    - the deep world fades into basalt / obsidian
+static Cell WallMaterial(const CaveParams *p, const BiomeInfo *bi, Biome b, int wx, int wy,
+                         const uint8_t *open, int w, int lx, int ly) {
+    if (b == BIOME_VOID) {
+        // Out-of-this-world: dark obsidian veined with shiny copper and
         // studded with glowing crystals.
         if (CellRandom(wx, wy, p->seed ^ 0x51A3u) < 0.05f) return CELL_CRYSTAL;
-        float vein = NoiseFbm(wx * p->scale * 1.6f + 200.0f, wy * p->scale * 1.6f + 90.0f, 2);
-        if (vein > 0.62f) return CELL_COPPER;
+        float vv = NoiseFbm(wx * p->scale * 1.6f + 200.0f, wy * p->scale * 1.6f + 90.0f, 2);
+        if (vv > 0.62f) return CELL_COPPER;
         return CELL_OBSIDIAN;
     }
 
-    if (b == BIOME_SANDY) { // loose sand surface over solid sandstone
-        bool surface = false;
-        for (int k = 1; k <= 4 && !surface; k++)
-            if (IsOpen(p, bi, wx, wy - k)) surface = true;
-        return surface ? CELL_SAND : CELL_SANDSTONE;
+    // Top-soil: walls within 3 cells under open air get a biome cover layer.
+    int soil = 0;
+    for (int k = 1; k <= 3; k++)
+        if (COpen(open, w, lx, ly - k)) { soil = k; break; }
+    if (soil) {
+        switch (b) {
+            case BIOME_JUNGLE:
+            case BIOME_OPEN:  return CELL_MUD;                            // soil
+            case BIOME_COLD:  return soil == 1 ? CELL_SNOW : CELL_ICE;    // snowcap
+            case BIOME_SANDY:
+            case BIOME_CORAL: return CELL_SAND;                           // dunes
+            default: break;                                               // barren
+        }
+    }
+    if (b == BIOME_SANDY) return CELL_SANDSTONE; // solid under the loose sand
+
+    // Jittered depth coordinate shared by veins and strata (slow undulation).
+    float band = wy + NoiseFbm(wx * 0.008f + 31.0f, wy * 0.008f + 77.0f, 2) * 50.0f - 25.0f;
+
+    // Ore veins: LOW frequency + tight threshold = a few thick, readable veins
+    // you discover - not scraggle wallpapered over every wall.
+    float vr = NoiseFbm(wx * p->scale * 0.45f + 641.0f, wy * p->scale * 0.9f + 13.0f, 2);
+    if (1.0f - fabsf(vr * 2.0f - 1.0f) > 0.94f) {
+        if (band > 380.0f) return CELL_GOLD;
+        if (band > 160.0f) return CELL_COPPER;
+        return CELL_COAL;
+    }
+    if (CellRandom(wx, wy, p->seed) < 0.0004f) return CELL_GOLD; // rare glints
+
+    // Deep strata: blend toward basalt with obsidian flecks below ~band 260.
+    if (band > 260.0f) {
+        float m = (band - 260.0f) / 220.0f;
+        if (m > 0.92f) m = 0.92f;
+        if (CellRandom(wx, wy, p->seed ^ 0xBEEFu) < m)
+            return (CellRandom(wx, wy, p->seed ^ 0x0B51u) < 0.06f) ? CELL_OBSIDIAN : CELL_BASALT;
     }
 
-    // Coal seams threaded through ordinary rock (fuel for fires deep down).
-    float coal = NoiseFbm(wx * p->scale * 1.5f + 501.0f, wy * p->scale * 1.5f + 87.0f, 2);
-    if (coal > 0.74f) return CELL_COAL;
-
-    float mud = NoiseFbm(wx * p->scale * 1.8f + 100.0f, wy * p->scale * 1.8f + 100.0f, 2);
+    // Secondary material as LARGE coherent slabs (low frequency), not speckle -
+    // big readable patches are a huge part of the hand-painted look.
+    float mud = NoiseFbm(wx * p->scale * 0.35f + 100.0f, wy * p->scale * 0.35f + 100.0f, 2);
     Cell wallA = bi ? bi->wallPrimary : CELL_ROCK;
     Cell wallB = bi ? bi->wallSecondary : CELL_MUD;
     return (mud > p->mudThreshold) ? wallB : wallA;
 }
 
-static Cell TerrainAt(const CaveParams *p, int wx, int wy) {
-    // 1) Hand-made structures take priority wherever they are placed.
-    Cell s = StructureSampleAt(p->seed, wx, wy);
-    if (s != CELL_EMPTY) return s;
+// Fill a buffer-rect with freshly generated terrain.
+// Pass 1 samples biome (with border dither) + openness once per cell into temp
+// arrays; pass 2 decides materials with all probes as array reads. Both passes
+// are row-band parallel via GridParallelFor (generation is pure functions of
+// world coordinates + seed, so banding cannot change the result).
+#define GEN_BAND 16
 
-    // 2) Pick the biome. Near a border, dither against the neighbouring biome
-    //    using a smooth noise so the two interleave organically (no hard line).
-    const BiomeInfo *bi = NULL;
-    Biome b = BIOME_ROCKY;
-    if (p->biomes) {
-        b = BiomeAt(wx, wy);
-        Biome bAlt = BiomeAt(wx + 5, wy + 3);
-        if (b != bAlt && NoiseFbm(wx * 0.05f + 9.0f, wy * 0.05f + 4.0f, 2) < 0.5f) b = bAlt;
-        bi = &BIOMES[b];
-    }
+typedef struct GenCtx {
+    Grid *g;
+    const CaveParams *p;
+    int bx0, by0, rw, rh, wx0, wy0, H;
+    uint8_t *open, *biome;
+} GenCtx;
 
-    // 3) Contained liquid bodies (lakes/pools) override the normal cave so
-    //    their solid shell always seals the liquid - it stays put untouched.
-    Cell pc;
-    if (PoolAt(p, bi, b, wx, wy, &pc)) return pc;
-
-    if (IsOpen(p, bi, wx, wy)) {
-        // Rock spikes hanging from ceilings / rising from floors.
-        if (IsSpike(p, bi, wx, wy, true) || IsSpike(p, bi, wx, wy, false)) return CELL_ROCK;
-
-        // Living surfaces: grass carpets mud floors; vines drape jungle ceilings.
-        if ((b == BIOME_JUNGLE || b == BIOME_OPEN) && DistDown(p, bi, wx, wy, 1) == 1) {
-            if (WallMaterial(p, bi, b, wx, wy + 1) == CELL_MUD &&
-                CellRandom(wx, wy, p->seed ^ 0x6Eu) < 0.45f)
-                return CELL_GRASS;
+static void GenPass1Band(int band, void *ud) {
+    GenCtx *c = ud;
+    const CaveParams *p = c->p;
+    int y0 = band * GEN_BAND, y1 = y0 + GEN_BAND;
+    if (y1 > c->H) y1 = c->H;
+    for (int ly = y0; ly < y1; ly++) {
+        int wy = c->wy0 + ly - GEN_VMARGIN;
+        for (int lx = 0; lx < c->rw; lx++) {
+            int wx = c->wx0 + lx;
+            Biome b = BIOME_ROCKY;
+            if (p->biomes) {
+                b = BiomeAt(wx, wy);
+                // Border blending: near a boundary the two biomes interleave in
+                // LARGE smooth patches (low-frequency mask) - reads like geology
+                // mixing, not per-cell static.
+                Biome bAlt = BiomeAt(wx + 5, wy + 3);
+                if (b != bAlt && NoiseFbm(wx * 0.02f + 9.0f, wy * 0.02f + 4.0f, 2) < 0.5f) b = bAlt;
+            }
+            const BiomeInfo *bi = p->biomes ? &BIOMES[b] : NULL;
+            c->biome[ly * c->rw + lx] = (uint8_t)b;
+            c->open [ly * c->rw + lx] = IsOpen(p, bi, wx, wy) ? 1 : 0;
         }
-        if (b == BIOME_JUNGLE && DistUp(p, bi, wx, wy, 1) == 1 &&
-            CellRandom(wx, wy, p->seed ^ 0x71u) < 0.30f)
-            return CELL_VINE;
-
-        return CELL_EMPTY;
     }
+}
 
-    return WallMaterial(p, bi, b, wx, wy);
+static void GenPass2Band(int band, void *ud) {
+    GenCtx *c = ud;
+    Grid *g = c->g;
+    const CaveParams *p = c->p;
+    int rw = c->rw, M = GEN_VMARGIN;
+    int y0 = band * GEN_BAND, y1 = y0 + GEN_BAND;
+    if (y1 > c->rh) y1 = c->rh;
+    for (int ly = y0; ly < y1; ly++) {
+        int wy = c->wy0 + ly;
+        for (int lx = 0; lx < rw; lx++) {
+            int wx = c->wx0 + lx;
+            Cell cell = CELL_EMPTY;
+
+            // Hand-made structures take priority wherever they are placed.
+            Cell s = StructureSampleAt(p->seed, wx, wy);
+            if (s != CELL_EMPTY) { GridSet(g, c->bx0 + lx, c->by0 + ly, s); continue; }
+
+            Biome b = (Biome)c->biome[(ly + M) * rw + lx];
+            const BiomeInfo *bi = p->biomes ? &BIOMES[b] : NULL;
+
+            // Contained pools override the cave so their shells always seal.
+            if (!PoolAt(p, bi, b, wx, wy, &cell)) {
+                if (COpen(c->open, rw, lx, ly)) {
+                    if (CSpike(p->seed, c->open, rw, lx, ly, wx, true) ||
+                        CSpike(p->seed, c->open, rw, lx, ly, wx, false)) {
+                        // Stalactites / stalagmites in the biome's own voice:
+                        // icicles, coral fingers, obsidian fangs...
+                        switch (b) {
+                            case BIOME_COLD:  cell = CELL_ICE;       break;
+                            case BIOME_SANDY: cell = CELL_SANDSTONE; break;
+                            case BIOME_CORAL: cell = CELL_CORAL;     break;
+                            case BIOME_VOID:  cell = CELL_OBSIDIAN;  break;
+                            default:          cell = CELL_ROCK;      break;
+                        }
+                    } else if ((b == BIOME_JUNGLE || b == BIOME_OPEN) &&
+                               !COpen(c->open, rw, lx, ly + 1) &&
+                               WallMaterial(p, bi, b, wx, wy + 1, c->open, rw, lx, ly + 1) == CELL_MUD &&
+                               CellRandom(wx, wy, p->seed ^ 0x6Eu) < 0.85f) {
+                        cell = CELL_GRASS;           // grass carpets mud floors (near-solid)
+                    } else if (b == BIOME_JUNGLE && !COpen(c->open, rw, lx, ly - 1) &&
+                               CellRandom(wx, wy, p->seed ^ 0x71u) < 0.30f) {
+                        cell = CELL_VINE;            // vines drape jungle ceilings
+                    }
+                } else {
+                    cell = WallMaterial(p, bi, b, wx, wy, c->open, rw, lx, ly);
+                }
+            }
+            GridSet(g, c->bx0 + lx, c->by0 + ly, cell);
+        }
+    }
+}
+
+static void RunBands(int rows, void (*fn)(int, void *), GenCtx *ctx) {
+    int bands = (rows + GEN_BAND - 1) / GEN_BAND;
+    if (GridParallelFor && bands > 1) GridParallelFor(bands, fn, ctx);
+    else for (int k = 0; k < bands; k++) fn(k, ctx);
+}
+
+static void GenRegion(Grid *g, int bx0, int by0, int rw, int rh) {
+    GenCtx ctx = {
+        .g = g, .p = &g->cave,
+        .bx0 = bx0, .by0 = by0, .rw = rw, .rh = rh,
+        .wx0 = g->originX + bx0, .wy0 = g->originY + by0,
+        .H = rh + 2 * GEN_VMARGIN,
+    };
+    ctx.open  = malloc((size_t)rw * ctx.H);
+    ctx.biome = malloc((size_t)rw * ctx.H);
+    if (!ctx.open || !ctx.biome) { free(ctx.open); free(ctx.biome); return; }
+
+    RunBands(ctx.H, GenPass1Band, &ctx); // pass 1 fully completes first
+    RunBands(rh,    GenPass2Band, &ctx);
+
+    free(ctx.open);
+    free(ctx.biome);
 }
 
 void GridRegenerate(Grid *g) {
     StoreClear(); // a fresh layout: forget previous edits
     NoiseInit(g->cave.seed);
-    for (int y = 0; y < g->height; y++)
-        for (int x = 0; x < g->width; x++)
-            GridSet(g, x, y, TerrainAt(&g->cave, g->originX + x, g->originY + y));
+    GenRegion(g, 0, 0, g->width, g->height);
     for (int i = 0; i < MAX_RIPPLES; i++) g->ripples[i].active = false;
+    WakeAll(g);
+}
+
+// Save a buffer-rect into the persistence store (uses the CURRENT origin).
+static void SaveRect(Grid *g, int x0, int y0, int x1, int y1) {
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            int i = y * g->width + x;
+            StoreSet(g->originX + x, g->originY + y, g->cells[i], g->life[i]);
+        }
+}
+
+// Generate an exposed buffer-rect, then overlay any persisted edits on top.
+static void FillRect(Grid *g, int x0, int y0, int x1, int y1) {
+    if (x0 >= x1 || y0 >= y1) return;
+    GenRegion(g, x0, y0, x1 - x0, y1 - y0);
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            Cell c; uint8_t lf;
+            if (StoreGet(g->originX + x, g->originY + y, &c, &lf)) {
+                GridSet(g, x, y, c);
+                g->life[y * g->width + x] = lf;
+            }
+        }
 }
 
 void GridStreamTo(Grid *g, int nox, int noy) {
+    // Quantise the origin to 8-cell steps so exposed strips arrive in batches
+    // (amortising GenRegion's vertical margin) instead of 1-cell slivers every
+    // frame. The buffer's spare edge absorbs the rounding; the camera doesn't
+    // care where the window origin sits.
+    nox = FloorDivI(nox, 8) * 8;
+    noy = FloorDivI(noy, 8) * 8;
     int dx = nox - g->originX, dy = noy - g->originY;
     if (dx == 0 && dy == 0) return;
     int w = g->width, h = g->height;
 
-    // 1) Save cells that are about to leave the window so they persist.
-    for (int oy = 0; oy < h; oy++) {
-        for (int ox = 0; ox < w; ox++) {
-            int nx = ox - dx, ny = oy - dy; // where this cell lands in the new window
-            if (nx < 0 || nx >= w || ny < 0 || ny >= h) {
-                int oi = oy * w + ox;
-                StoreSet(g->originX + ox, g->originY + oy, g->cells[oi], g->life[oi]);
-            }
-        }
+    // 1) Save ONLY the departing strips (cells with no home in the new window).
+    int sx0 = dx > 0 ? (dx < w ? dx : w) : 0;          // surviving column range
+    int sx1 = dx < 0 ? (w + dx > 0 ? w + dx : 0) : w;
+    if (sx0 > 0) SaveRect(g, 0, 0, sx0, h);
+    if (sx1 < w) SaveRect(g, sx1, 0, w, h);
+    if (sx0 < sx1) {
+        if (dy > 0) SaveRect(g, sx0, 0, sx1, dy < h ? dy : h);
+        if (dy < 0) SaveRect(g, sx0, h + dy > 0 ? h + dy : 0, sx1, h);
     }
 
-    // 2) Build the shifted window; newly exposed cells come from the store
-    //    (persisted edits) or, failing that, freshly generated terrain.
+    // 2) Shift surviving cells into place via the scratch buffers.
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             int di = y * w + x, sx = x + dx, sy = y + dy;
@@ -974,11 +1249,7 @@ void GridStreamTo(Grid *g, int nox, int noy) {
                 int si = sy * w + sx;
                 g->sCells[di] = g->cells[si]; g->sFlow[di] = g->flow[si]; g->sLife[di] = g->life[si];
             } else {
-                int wx = nox + x, wy = noy + y;
-                Cell c; uint8_t lf;
-                if (StoreGet(wx, wy, &c, &lf)) { g->sCells[di] = c; g->sLife[di] = lf; }
-                else { c = TerrainAt(&g->cave, wx, wy); g->sCells[di] = c; g->sLife[di] = MATERIALS[c].life; }
-                g->sFlow[di] = 0;
+                g->sCells[di] = CELL_EMPTY; g->sFlow[di] = 0; g->sLife[di] = 0;
             }
         }
     }
@@ -987,6 +1258,20 @@ void GridStreamTo(Grid *g, int nox, int noy) {
     memcpy(g->flow,  g->sFlow,  n * sizeof(int8_t));
     memcpy(g->life,  g->sLife,  n * sizeof(uint8_t));
     g->originX = nox; g->originY = noy;
+
+    // 3) Generate the exposed strips (persisted edits overlaid by FillRect).
+    int ex0 = dx < 0 ? (-dx < w ? -dx : w) : 0;        // exposed left strip width
+    int ex1 = dx > 0 ? (w - dx > 0 ? w - dx : 0) : w;  // first exposed right column
+    if (ex0 > 0) FillRect(g, 0, 0, ex0, h);
+    if (ex1 < w) FillRect(g, ex1, 0, w, h);
+    if (ex0 < ex1) {
+        if (dy < 0) FillRect(g, ex0, 0, ex1, -dy < h ? -dy : h);
+        if (dy > 0) FillRect(g, ex0, h - dy > 0 ? h - dy : 0, ex1, h);
+    }
+
+    // The world shifted under the tile flags - wake everything once so moved
+    // liquids/gases re-settle, then the quiet tiles fall back asleep.
+    WakeAll(g);
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,12 +1306,174 @@ void GridSnapshot(Grid *g) {
     g->rOriginY = g->originY;
 }
 
+// Colour of the snapshot cell at buffer (x,y), index i. Animated effects keyed
+// on WORLD coordinates so speckle/shimmer stick to the terrain instead of
+// swimming across it as the window streams.
+static Color CellColor(const Grid *g, int x, int y, int i, float t) {
+    Cell mat = g->rCells[i];
+    Color c = MATERIALS[mat].color;
+    int wx = g->rOriginX + x, wy = g->rOriginY + y;
+    int n = Hash(wx, wy) - 128;
+
+    switch (mat) {
+        case CELL_WATER: {
+            int s = (int)(sinf(wx * 0.4f + wy * 0.2f + t * 3.0f) * 18.0f);
+            c.g = ClampB(c.g + s); c.b = ClampB(c.b + s);
+            if (y == 0 || g->rCells[i - g->width] != CELL_WATER) { // surface foam
+                c.r = ClampB(c.r + 70); c.g = ClampB(c.g + 60); c.b = ClampB(c.b + 25);
+            }
+        } break;
+        case CELL_FIRE: {
+            float k = g->rLife[i] / (float)MATERIALS[CELL_FIRE].life;
+            int f = GetRandomValue(-30, 30);
+            // White-hot core when fresh, cooling to deep orange as it dies.
+            float core = k > 0.7f ? (k - 0.7f) / 0.3f : 0.0f;
+            c.r = 255;
+            c.g = ClampB((int)(110 + 130 * k) + f);
+            c.b = ClampB((int)(25 * k + 170 * core) + f / 3);
+        } break;
+        case CELL_ACID: {
+            // Tint by potency: vivid green when strong, pale watery teal when
+            // nearly diluted - you can see acid weakening.
+            float k = g->rLife[i] / (float)MATERIALS[CELL_ACID].life;
+            c.r = ClampB((int)(120 * k +  70 * (1.0f - k)));
+            c.g = ClampB((int)(205 * k + 165 * (1.0f - k)));
+            c.b = ClampB((int)( 60 * k + 205 * (1.0f - k)));
+        } break;
+        case CELL_LAVA: {
+            float glow = sinf(wx * 0.5f + wy * 0.5f + t * 4.0f) * 0.5f + 0.5f;
+            c.r = ClampB(220 + (int)(35 * glow));
+            c.g = ClampB(60 + (int)(90 * glow) + n / 6);
+            c.b = ClampB(10 + (int)(20 * glow));
+        } break;
+        case CELL_GOLD: {
+            float pulse = sinf(t * 2.5f + (wx + wy) * 0.6f) * 0.5f + 0.5f;
+            c.r = ClampB(c.r + (int)(20 * pulse));
+            c.g = ClampB(c.g + (int)(30 * pulse));
+        } break;
+        case CELL_MOLTEN_GLASS: {
+            float glow = sinf(wx * 0.6f + wy * 0.4f + t * 5.0f) * 0.5f + 0.5f;
+            c.r = 255;
+            c.g = ClampB(150 + (int)(80 * glow));
+            c.b = ClampB(40 + (int)(40 * glow));
+        } break;
+        case CELL_CRYSTAL: {
+            float pulse = sinf(t * 1.8f + (wx * 0.7f - wy * 0.5f)) * 0.5f + 0.5f;
+            c.r = ClampB(120 + (int)(60 * pulse));
+            c.g = ClampB(190 + (int)(50 * pulse));
+            c.b = 255;
+        } break;
+        case CELL_COPPER: {
+            float spec = sinf(wx * 0.9f + wy * 0.5f + t * 1.5f);
+            int s = (int)(fmaxf(spec, 0.0f) * 55.0f);
+            c.r = ClampB(c.r + s); c.g = ClampB(c.g + s * 3 / 4); c.b = ClampB(c.b + s / 2);
+        } break;
+        case CELL_MERCURY: {
+            float spec = sinf(wx * 0.8f + wy * 0.4f + t * 2.0f);
+            int s = (int)(fmaxf(spec, 0.0f) * 60.0f);
+            c.r = ClampB(c.r + s); c.g = ClampB(c.g + s); c.b = ClampB(c.b + s);
+        } break;
+        case CELL_SPARK: {
+            int f = GetRandomValue(-45, 45);
+            c.r = ClampB(190 + f); c.g = ClampB(225 + f); c.b = 255;
+        } break;
+        case CELL_MOLTEN_WAX: {
+            float glow = sinf(wx * 0.5f + wy * 0.3f + t * 3.0f) * 0.5f + 0.5f;
+            c.r = ClampB(c.r + (int)(25 * glow));
+            c.g = ClampB(c.g + (int)(18 * glow));
+        } break;
+        case CELL_CORAL: {
+            switch (Hash(wx * 3, wy * 7) & 3) { // vivid multi-hue reef
+                case 0: c = (Color){255, 110, 150, 255}; break; // pink
+                case 1: c = (Color){255, 150,  80, 255}; break; // orange
+                case 2: c = (Color){180, 110, 220, 255}; break; // purple
+                default:c = (Color){ 90, 210, 200, 255}; break; // teal
+            }
+            c.r = ClampB(c.r + n / 14); c.g = ClampB(c.g + n / 14); c.b = ClampB(c.b + n / 14);
+        } break;
+        case CELL_SMOKE:
+        case CELL_VAPOR: {
+            float k = g->rLife[i] / (float)MATERIALS[mat].life;
+            c.a = ClampB((int)(40 + 180 * k));
+        } break;
+        default:
+            c.r = ClampB(c.r + n / 12); c.g = ClampB(c.g + n / 12); c.b = ClampB(c.b + n / 12);
+            break;
+    }
+
+    if (!MATERIALS[mat].emissive) {
+        // Darken with depth (deeper = dimmer) and keep below the bloom gate.
+        float df = 1.0f - wy * 0.00045f;
+        if (df > 1.0f) df = 1.0f; if (df < 0.35f) df = 0.35f;
+        c.r = (unsigned char)(c.r * df);
+        c.g = (unsigned char)(c.g * df);
+        c.b = (unsigned char)(c.b * df);
+        c = CapBrightness(c, 195);
+    }
+    return c;
+}
+
+void GridDrawRipples(const Grid *g) {
+    for (int i = 0; i < MAX_RIPPLES; i++) {
+        const Ripple *r = &g->rRipples[i];
+        if (!r->active) continue;
+        DrawCircleLines((int)r->x, (int)r->y, r->radius,
+                        Fade((Color){180, 220, 255, 255}, r->life * 0.6f));
+    }
+}
+
+// Fast path: one colour per cell into a pixel buffer; the renderer uploads it
+// as a single texture and draws ONE scaled quad. Only the camera-visible rect
+// (plus margin) is recomputed each frame; offscreen texels keep their last
+// colour and are clipped by the GPU anyway. When zoomed far out, cells are
+// sub-pixel, so a flat per-material colour replaces the animated effects.
+void GridFillPixels(const Grid *g, Color *out, Camera2D camera) {
+    float t = (float)GetTime();
+
+    Vector2 tl = GetScreenToWorld2D((Vector2){0, 0}, camera);
+    Vector2 br = GetScreenToWorld2D((Vector2){(float)GetScreenWidth(), (float)GetScreenHeight()}, camera);
+    int x0 = (int)(tl.x / CELL_SIZE) - 2 - g->rOriginX, y0 = (int)(tl.y / CELL_SIZE) - 2 - g->rOriginY;
+    int x1 = (int)(br.x / CELL_SIZE) + 2 - g->rOriginX, y1 = (int)(br.y / CELL_SIZE) + 2 - g->rOriginY;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > g->width)  x1 = g->width;
+    if (y1 > g->height) y1 = g->height;
+
+    if (camera.zoom >= 0.45f) {
+        for (int y = y0; y < y1; y++) {
+            int i = y * g->width + x0;
+            for (int x = x0; x < x1; x++, i++)
+                out[i] = (g->rCells[i] == CELL_EMPTY) ? (Color){0, 0, 0, 0}
+                                                      : CellColor(g, x, y, i, t);
+        }
+        return;
+    }
+
+    // Far zoom: flat colours (pre-capped per material) + per-row depth fade.
+    Color flat[CELL_COUNT];
+    for (int m = 0; m < CELL_COUNT; m++)
+        flat[m] = MATERIALS[m].emissive ? MATERIALS[m].color
+                                        : CapBrightness(MATERIALS[m].color, 195);
+    for (int y = y0; y < y1; y++) {
+        float df = 1.0f - (g->rOriginY + y) * 0.00045f;
+        if (df > 1.0f) df = 1.0f; if (df < 0.35f) df = 0.35f;
+        int i = y * g->width + x0;
+        for (int x = x0; x < x1; x++, i++) {
+            Cell mat = g->rCells[i];
+            if (mat == CELL_EMPTY) { out[i] = (Color){0, 0, 0, 0}; continue; }
+            Color c = flat[mat];
+            if (!MATERIALS[mat].emissive) {
+                c.r = (unsigned char)(c.r * df);
+                c.g = (unsigned char)(c.g * df);
+                c.b = (unsigned char)(c.b * df);
+            }
+            out[i] = c;
+        }
+    }
+}
+
+// Per-rectangle path, kept for the editor's small canvas.
 void GridDrawWorld(const Grid *g, Camera2D camera) {
     float t = (float)GetTime();
-    // Read from the render snapshot, not the live arrays (the worker thread may
-    // be mutating those concurrently).
-    const Cell    *cells   = g->rCells;
-    const uint8_t *lifeArr = g->rLife;
     int originX = g->rOriginX, originY = g->rOriginY;
 
     Vector2 tl = GetScreenToWorld2D((Vector2){0, 0}, camera);
@@ -1040,110 +1487,10 @@ void GridDrawWorld(const Grid *g, Camera2D camera) {
     for (int y = y0; y < y1; y++) {
         for (int x = x0; x < x1; x++) {
             int i = Idx(g, x, y);
-            Cell mat = cells[i];
-            if (mat == CELL_EMPTY) continue;
-            Color c = MATERIALS[mat].color;
-            int n = Hash(x, y) - 128;
-
-            switch (mat) {
-                case CELL_WATER: {
-                    int s = (int)(sinf(x * 0.4f + y * 0.2f + t * 3.0f) * 18.0f);
-                    c.g = ClampB(c.g + s); c.b = ClampB(c.b + s);
-                    if (!GridInBounds(g, x, y - 1) || cells[Idx(g, x, y - 1)] != CELL_WATER) {
-                        c.r = ClampB(c.r + 70); c.g = ClampB(c.g + 60); c.b = ClampB(c.b + 25);
-                    }
-                } break;
-                case CELL_FIRE: {
-                    float k = lifeArr[i] / (float)MATERIALS[CELL_FIRE].life;
-                    int f = GetRandomValue(-25, 25);
-                    c.r = 255; c.g = ClampB((int)(90 + 120 * k) + f); c.b = ClampB((int)(20 * k) + f / 2);
-                } break;
-                case CELL_LAVA: {
-                    float glow = sinf(x * 0.5f + y * 0.5f + t * 4.0f) * 0.5f + 0.5f;
-                    c.r = ClampB(220 + (int)(35 * glow));
-                    c.g = ClampB(60 + (int)(90 * glow) + n / 6);
-                    c.b = ClampB(10 + (int)(20 * glow));
-                } break;
-                case CELL_GOLD: {
-                    float pulse = sinf(t * 2.5f + (x + y) * 0.6f) * 0.5f + 0.5f;
-                    c.r = ClampB(c.r + (int)(20 * pulse));
-                    c.g = ClampB(c.g + (int)(30 * pulse));
-                } break;
-                case CELL_MOLTEN_GLASS: {
-                    float glow = sinf(x * 0.6f + y * 0.4f + t * 5.0f) * 0.5f + 0.5f;
-                    c.r = 255;
-                    c.g = ClampB(150 + (int)(80 * glow));
-                    c.b = ClampB(40 + (int)(40 * glow));
-                } break;
-                case CELL_CRYSTAL: {
-                    // Glowing gemstone: pulsing cool light (emissive -> blooms).
-                    float pulse = sinf(t * 1.8f + (x * 0.7f - y * 0.5f)) * 0.5f + 0.5f;
-                    c.r = ClampB(120 + (int)(60 * pulse));
-                    c.g = ClampB(190 + (int)(50 * pulse));
-                    c.b = 255;
-                } break;
-                case CELL_COPPER: {
-                    // Metallic sheen: a moving specular streak across the ore.
-                    float spec = sinf(x * 0.9f + y * 0.5f + t * 1.5f);
-                    int s = (int)(fmaxf(spec, 0.0f) * 55.0f);
-                    c.r = ClampB(c.r + s); c.g = ClampB(c.g + s * 3 / 4); c.b = ClampB(c.b + s / 2);
-                } break;
-                case CELL_MERCURY: {
-                    // Liquid-metal silver with a sliding specular highlight.
-                    float spec = sinf(x * 0.8f + y * 0.4f + t * 2.0f);
-                    int s = (int)(fmaxf(spec, 0.0f) * 60.0f);
-                    c.r = ClampB(c.r + s); c.g = ClampB(c.g + s); c.b = ClampB(c.b + s);
-                } break;
-                case CELL_SPARK: {
-                    // Crackling electric blue-white (emissive -> blooms).
-                    int f = GetRandomValue(-45, 45);
-                    c.r = ClampB(190 + f); c.g = ClampB(225 + f); c.b = 255;
-                } break;
-                case CELL_MOLTEN_WAX: {
-                    float glow = sinf(x * 0.5f + y * 0.3f + t * 3.0f) * 0.5f + 0.5f;
-                    c.r = ClampB(c.r + (int)(25 * glow));
-                    c.g = ClampB(c.g + (int)(18 * glow));
-                } break;
-                case CELL_CORAL: {
-                    // Multi-colour reef: pick a hue per cell for a vivid look.
-                    switch (Hash(x * 3, y * 7) & 3) {
-                        case 0: c = (Color){255, 110, 150, 255}; break; // pink
-                        case 1: c = (Color){255, 150,  80, 255}; break; // orange
-                        case 2: c = (Color){180, 110, 220, 255}; break; // purple
-                        default:c = (Color){ 90, 210, 200, 255}; break; // teal
-                    }
-                    c.r = ClampB(c.r + n / 14); c.g = ClampB(c.g + n / 14); c.b = ClampB(c.b + n / 14);
-                } break;
-                case CELL_SMOKE:
-                case CELL_VAPOR: {
-                    float k = lifeArr[i] / (float)MATERIALS[mat].life;
-                    c.a = ClampB((int)(40 + 180 * k));
-                } break;
-                default:
-                    c.r = ClampB(c.r + n / 12); c.g = ClampB(c.g + n / 12); c.b = ClampB(c.b + n / 12);
-                    break;
-            }
-
-            if (!MATERIALS[mat].emissive) {
-                // Darken with depth (deeper = dimmer) and keep below bloom.
-                int worldY = originY + y;
-                float df = 1.0f - worldY * 0.00045f;
-                if (df > 1.0f) df = 1.0f; if (df < 0.35f) df = 0.35f;
-                c.r = (unsigned char)(c.r * df);
-                c.g = (unsigned char)(c.g * df);
-                c.b = (unsigned char)(c.b * df);
-                c = CapBrightness(c, 195);
-            }
-
+            if (g->rCells[i] == CELL_EMPTY) continue;
             DrawRectangle((originX + x) * CELL_SIZE, (originY + y) * CELL_SIZE,
-                          CELL_SIZE, CELL_SIZE, c);
+                          CELL_SIZE, CELL_SIZE, CellColor(g, x, y, i, t));
         }
     }
-
-    for (int i = 0; i < MAX_RIPPLES; i++) {
-        const Ripple *r = &g->rRipples[i];
-        if (!r->active) continue;
-        DrawCircleLines((int)r->x, (int)r->y, r->radius,
-                        Fade((Color){180, 220, 255, 255}, r->life * 0.6f));
-    }
+    GridDrawRipples(g);
 }

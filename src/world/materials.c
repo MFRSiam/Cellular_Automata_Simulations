@@ -10,7 +10,7 @@ const MatInfo MATERIALS[CELL_COUNT] = {
     [CELL_WATER]        = {"Water",     { 64, 128, 220, 255}, TYPE_LIQUID, 100, false,   0, false, false},
     [CELL_WOOD]         = {"Wood",      {112,  74,  40, 255}, TYPE_SOLID,  500, true,    0, false, false},
     [CELL_OIL]          = {"Oil",       {120,  90,  40, 255}, TYPE_LIQUID,  60, true,    0, false, false},
-    [CELL_ACID]         = {"Acid",      {120, 200,  60, 255}, TYPE_LIQUID, 120, false,   0, false, false},
+    [CELL_ACID]         = {"Acid",      {120, 200,  60, 255}, TYPE_LIQUID, 120, false, 160, false, false}, // life = potency
     [CELL_SNOW]         = {"Snow",      {220, 226, 240, 255}, TYPE_POWDER,  40, false,   0, false, false},
     [CELL_FIRE]         = {"Fire",      {255, 140,  30, 255}, TYPE_GAS,    -15, false,  70, true,  false},
     [CELL_SMOKE]        = {"Smoke",     { 60,  60,  68, 255}, TYPE_GAS,    -25, false, 180, false, false},

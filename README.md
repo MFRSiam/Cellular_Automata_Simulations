@@ -13,9 +13,13 @@ A real-time falling-sand / fluid simulation built with **C17**, **raylib 5.5**, 
 - **Electricity** — sparks arc along conductors (metal, copper, gold, water, mercury), ignite fuel, detonate gunpowder, and flash-boil water
 
 ### World Generation
-- **Layered, multi-scale terrain** — independent noises drive different scales: **macro** (domain-warped low frequency) shapes the big caverns/masses, **micro** (high frequency) roughens wall detail, and **meso** ridged noise carves connected winding tunnels so caves are rarely fully sealed
-- **Stalactites & stalagmites** hanging from ceilings and rising from floors
-- **Lakes & pools** — flooded underwater caverns, deep **lava lakes**, **acid pools**, and frozen **ice lakes** in cold biomes
+- **Noita-style silhouettes** — the base field is deliberately smooth (low frequency, 2 octaves, zero per-cell roughness); all the character comes from a **two-stage domain warp** (a big sweep that bends whole formations + a smaller swirl that curls the edges), producing flowing rock tongues and overhangs with clean boundaries. Caverns are anisotropic (wider than tall → walkable floors) and **worm-tunnel ridges** at two scales link them
+- **Characterful spikes** — stalactites speak each biome's language: rock cones, **icicles** in cold, **coral fingers** in the reef, **obsidian fangs** in the void
+- **Depth strata** — the band around y=0 is airy and open; the world grows denser with depth and fades into **basalt/obsidian** bedrock; ores are layered too (coal shallow → copper mid → gold deep)
+- **Ore veins** — elongated ridged streaks, not blobs; cut a deep gold vein and the gold **pours out** (it's a heavy powder)
+- **Top-soil** — any wall under open air gets a biome cover: mud (grass roots in it), dunes of sand, or **snow-capped ice** in cold biomes
+- **Stalactites & stalagmites** — long contiguous cones (2–7 cells) on ~1 in 4 columns
+- **Anchored liquid pockets** — one lens-shaped pocket per ~96-cell region (30% chance), wider than tall like real ponds, with an organically wobbled but **guaranteed-sealed** shell; contents follow depth: surface ponds → mid water/oil/acid → deep **lava lakes** and **sealed gold treasure pockets**
 - **Living world** — grass **spreads across mud surfaces** (and the fresh mud worms leave), vines drape jungle ceilings, moss creeps over damp soil near water
 - **Critters** (pixel-art) — **frogs** leap through jungle biomes actively hunting **flies**; flies **multiply** over time but **disperse** so they don't clump in pits; **worms** burrow through rocky biomes, slowly **gnawing each rock into mud** over time (which grass then colonises). Kill any critter with an element (fire/lava/acid/spark…) and it spills **blood** — which then attracts more flies (carrion → predators → more blood)
 - **Out-of-this-world Void biome** — dark obsidian shot through with shiny copper veins and glowing crystals
@@ -32,7 +36,7 @@ A real-time falling-sand / fluid simulation built with **C17**, **raylib 5.5**, 
 
 ### Developer Features
 - **Structure Manager** — a dedicated menu scene (built with raygui) to browse saved structures as thumbnails, **delete** them, and create new ones
-- **Structure Editor** — a blank black canvas with the live simulation running; paint materials, watch them interact, see a real-time stats panel (total pixels + per-material breakdown), and save the result as a structure
+- **Structure Editor** — a blank canvas with the live simulation running and a full tool box: **Brush, straight Line, Rectangle, Circle (outline or filled), flood Fill, and an eyedropper Pick tool**, with drag previews on the canvas. Materials are chosen from a **swatch picker** in the side panel (same palette as in-game), with a brush-size slider, live stats (total pixels + top materials), and play/pause/clear/save controls
 - **Structure capture tool** (F2) — in-world: drag to save hand-made regions, they scatter deterministically in the world
 - **Live cave parameter tweaking** — adjust Perlin scale, threshold, octaves, and see changes instantly
 - **Settings menu** — toggle effects (bloom, water, heat, biomes) without restarting
@@ -98,10 +102,12 @@ your **position relative to the world origin (0,0)**.
 | Lava + Water | Lava → Basalt (black stone), Water → Vapor |
 | Lava + Ice | Ice melts to water |
 | Lava (air-cooled) | → Obsidian (dark glass) |
-| Lava + Rock/Mud/Sandstone | Slowly melts them back into lava |
+| Lava + Rock/Mud/Sandstone | Erodes them back into lava **very slowly** (minutes, not seconds) |
+| Lava + Sand/Glass/Wax/Ice | Melts each at its own rate — heat soaks in over time, nothing converts instantly |
 | Lava + Sand | Sand → Molten Glass |
 | Molten Glass + Water/Air | → Solid Glass |
-| Acid + Solids/Powders | Dissolves them (unless acid-proof) |
+| Acid + Solids/Powders | Dissolves them — and the reaction **consumes the acid** (each cell has potency; spent acid fizzles out, sometimes as corrosive gas) |
+| Acid + Water | **Dilutes gradually** — adjacent water saps potency, the acid visibly pales, and only fully-drained acid becomes water |
 | Acid + Glass/Metal/Obsidian | **Contained** (acid-proof materials hold it) |
 | Fire + Oil/Gas | Catch quickly and burn up fast |
 | Fire + Wood/Moss | Smoulder slowly |
@@ -109,7 +115,6 @@ your **position relative to the world origin (0,0)**.
 | Water surrounded by Ice/Snow (no heat) | **Freezes** to ice (phase change) |
 | Moss + adjacent Water | **Grows** onto neighbouring mud/sand (plants colonise damp soil) |
 | Mud + Fire/Lava | **Bakes** into sandstone (fired clay → ceramic) |
-| Acid + lots of Water | **Diluted/neutralised** back into water |
 | Gunpowder + Fire/Lava/Spark | **Explodes** — fireball that ignites and blasts soft matter |
 | Spark + conductor (metal/copper/gold/water/mercury) | **Arcs** along it, fading over distance |
 | Spark + Oil/Gas/Gunpowder | Ignites / detonates |
@@ -186,11 +191,43 @@ src/
 
 ### Threading model
 
-The simulation runs on a **background worker thread** (`world/sim.c`) while the
-main thread handles input and rendering. A mutex guards the grid: the main
-thread takes a fast snapshot under the lock, then the expensive draw + shader
-passes run unlocked, in parallel with the next simulation step. If the worker
-fails to start, the sim falls back to stepping on the main thread.
+The simulation is **fully multithreaded** (`world/sim.c`):
+- A **coordinator thread** paces steps at the target rate, sleeping only the
+  *remainder* of each step's time budget.
+- A persistent **worker pool** (cores − 2 helpers; the coordinator and, during
+  regeneration, the main thread also participate) executes the step as column
+  strips in **two checkerboard phases** — even strips in parallel, then odd —
+  so concurrently-processed strips are never adjacent and cell interactions
+  (reach ≤ 7 cells, strips ≥ 24 wide) cannot race.
+- **World generation runs on the same pool** (row bands, pure functions of
+  seed + coordinates, so output is deterministic regardless of thread count).
+- Simulation code uses **thread-local RNG** (xorshift32) — raylib's global RNG
+  is only touched from the main thread.
+- A mutex guards the grid: the main thread paints/streams/snapshots under the
+  lock, then drawing + shaders run unlocked, overlapping the next sim step.
+  If the coordinator fails to start, the sim falls back to the main thread.
+
+### Performance architecture
+
+- **Sleeping tiles** — the buffer is split into 32×32 tiles; fully settled tiles
+  are skipped by the simulation. Any cell change wakes its 3×3 tile
+  neighbourhood, and a small random set of tiles is woken each step so ambient
+  life (grass, moss, coral, lava cooling) still ticks. The HUD shows the
+  percentage of tiles awake (`sim N%`).
+- **One-texture world rendering** — every frame the cell snapshot is converted
+  to a one-texel-per-cell RGBA buffer and uploaded as a single texture, drawn
+  as one scaled quad. Only the camera-visible rect is recomputed, and at far
+  zoom (cells sub-pixel) a flat-colour fast path skips the animated effects.
+  All compositing, water/heat/bloom post-processing, and scaling run on the
+  GPU (GLSL 4.30).
+- **Two-pass generation** — `GenRegion` samples biome + openness once per cell
+  into cached arrays (pass 1), then decides materials with all vertical probes
+  (stalactites, surfaces, plant anchors) as array reads (pass 2). Streaming
+  generates only the newly exposed strips, and the window origin moves in
+  8-cell steps so strips arrive in batches that amortise the generation margin.
+- **World-anchored speckle** — per-cell colour noise is keyed on world
+  coordinates, so terrain texture stays glued to the terrain while panning
+  instead of "swimming".
 
 ## Design Notes
 

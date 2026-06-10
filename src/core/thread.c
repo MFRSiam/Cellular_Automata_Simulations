@@ -50,6 +50,25 @@ void Mutex_Unlock(Mutex *m)  { LeaveCriticalSection((CRITICAL_SECTION *)m->impl)
 void Mutex_Destroy(Mutex *m) {
     if (m->impl) { DeleteCriticalSection((CRITICAL_SECTION *)m->impl); free(m->impl); m->impl = NULL; }
 }
+
+void Cond_Init(Cond *c) {
+    CONDITION_VARIABLE *cv = malloc(sizeof *cv);
+    InitializeConditionVariable(cv);
+    c->impl = cv;
+}
+void Cond_Wait(Cond *c, Mutex *m) {
+    SleepConditionVariableCS((CONDITION_VARIABLE *)c->impl, (CRITICAL_SECTION *)m->impl, INFINITE);
+}
+void Cond_Broadcast(Cond *c) { WakeAllConditionVariable((CONDITION_VARIABLE *)c->impl); }
+void Cond_Destroy(Cond *c)   { free(c->impl); c->impl = NULL; }
+
+int Thread_HWThreads(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors;
+    return n > 0 ? n : 1;
+}
+
 void Thread_SleepMs(int ms)  { Sleep((DWORD)ms); }
 
 #else
@@ -89,6 +108,25 @@ void Mutex_Unlock(Mutex *m)  { pthread_mutex_unlock((pthread_mutex_t *)m->impl);
 void Mutex_Destroy(Mutex *m) {
     if (m->impl) { pthread_mutex_destroy((pthread_mutex_t *)m->impl); free(m->impl); m->impl = NULL; }
 }
+
+void Cond_Init(Cond *c) {
+    pthread_cond_t *cv = malloc(sizeof *cv);
+    pthread_cond_init(cv, NULL);
+    c->impl = cv;
+}
+void Cond_Wait(Cond *c, Mutex *m) {
+    pthread_cond_wait((pthread_cond_t *)c->impl, (pthread_mutex_t *)m->impl);
+}
+void Cond_Broadcast(Cond *c) { pthread_cond_broadcast((pthread_cond_t *)c->impl); }
+void Cond_Destroy(Cond *c) {
+    if (c->impl) { pthread_cond_destroy((pthread_cond_t *)c->impl); free(c->impl); c->impl = NULL; }
+}
+
+int Thread_HWThreads(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+}
+
 void Thread_SleepMs(int ms)  { usleep((useconds_t)ms * 1000); }
 
 #endif

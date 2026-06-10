@@ -22,13 +22,14 @@
 #include <stdio.h>
 #include <time.h>
 
-// How many screen-sized chunks to simulate across/down. 5 => a wide 5x5 block
-// around you, so the simulation keeps running well outside the visible area.
-#define SIM_CHUNKS 5
+// How many screen-sized chunks to simulate across/down. 7 => a huge 7x7 block
+// (~700k cells) simulates around you - the multithreaded stepper spreads it
+// across all cores, and sleeping tiles skip the settled majority.
+#define SIM_CHUNKS 7
 // MIN_ZOOM is matched so the most zoomed-out view stays within the simulated
-// buffer (no visible static/edge): 5 chunks * 160 cells * 8px = 6400px wide,
-// shown in a 1280px window => ~0.20; a touch under that to leave a margin.
-#define MIN_ZOOM 0.18f   // zoom way out and survey the whole live region
+// buffer (no visible static/edge): 7 chunks * 1280px = 8960px wide, shown in
+// a 1280px window => 0.143 minimum; 0.15 leaves a margin.
+#define MIN_ZOOM 0.15f   // zoom way out and survey the whole live region
 #define MAX_ZOOM 16.0f   // zoomed in: close inspection of individual cells
 
 typedef enum AppState { STATE_MENU, STATE_SETTINGS, STATE_STRUCTURES, STATE_EDITOR, STATE_GAME } AppState;
